@@ -58,6 +58,10 @@ type PluginConfigurationSpec struct {
 	// +optional
 	WALPrefetch *WALPrefetchConfiguration `json:"walPrefetch,omitempty"`
 
+	// Backup configures how base backups are produced.
+	// +optional
+	Backup *BackupConfiguration `json:"backup,omitempty"`
+
 	// ClientSecretName is the name of the secret containing the client credentials
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
@@ -164,6 +168,25 @@ type CompressionPolicy struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxSize int64 `json:"maxSize,omitempty" mapstructure:"maxSize"`
+}
+
+// BackupConfiguration configures how base backups are produced.
+// +kubebuilder:validation:XValidation:rule="!has(self.incremental) || !self.incremental || self.useBaseBackupProtocol",message="incremental requires useBaseBackupProtocol to be true"
+type BackupConfiguration struct {
+	// UseBaseBackupProtocol sources base backups from the PostgreSQL
+	// BASE_BACKUP streaming-replication protocol and ingests them through the
+	// kopia-pgbasebackup helper, instead of snapshotting a locally-mounted
+	// PGDATA. This does not require the data volume to be mountable.
+	// +optional
+	UseBaseBackupProtocol bool `json:"useBaseBackupProtocol,omitempty"`
+
+	// Incremental enables PostgreSQL incremental base backups
+	// (BASE_BACKUP INCREMENTAL). It requires useBaseBackupProtocol and PostgreSQL
+	// 17 or newer. The source cluster must also set summarize_wal=on under
+	// spec.postgresql.parameters; the plugin does not set it. When no usable
+	// prior backup is available, the backup falls back to a full backup.
+	// +optional
+	Incremental bool `json:"incremental,omitempty"`
 }
 
 // WALPrefetchConfiguration configures WAL prefetching during recovery.

@@ -1,0 +1,60 @@
+version: "2"
+linters:
+  default: all
+  disable:
+    - mnd
+    - depguard
+    - exhaustruct
+    - funlen
+    - paralleltest
+    - testpackage
+    - wsl
+    - wsl_v5
+    - err113
+    - wrapcheck
+    - varnamelen
+    - nilnil
+    - goconst
+    - godox
+    - gomodguard
+    - noinlineerr
+  settings:
+    gomoddirectives:
+      # The Kopia library is consumed under its canonical import path but
+      # currently sourced from the Klio fork until the patches land upstream.
+      replace-allow-list:
+        - github.com/kopia/kopia
+    lll:
+      line-length: 120
+    nlreturn:
+      block-size: 3
+    ireturn:
+      allow:
+        - error
+        - stdlib
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/cloudnative-pg/klio)
+        - blank
+        - dot
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

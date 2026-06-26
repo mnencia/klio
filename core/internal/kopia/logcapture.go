@@ -35,6 +35,36 @@ import (
 
 var errDiskSpaceExhausted = errors.New("disk space exhausted")
 
+// stderrTailLines is the number of trailing stderr lines retained to enrich a
+// command-failure error. The lines are still logged in full; this is only the
+// excerpt embedded in the returned error.
+const stderrTailLines = 20
+
+// stderrTail keeps the most recent stderr lines so a command failure can report
+// the actual cause rather than a bare "exit status N". It is safe for the
+// streaming goroutine to write while RunWithLogCapture reads after the join.
+type stderrTail struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (t *stderrTail) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return strings.Join(t.lines, "\n")
+}
+
+func (t *stderrTail) add(line string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.lines = append(t.lines, line)
+	if len(t.lines) > stderrTailLines {
+		t.lines = t.lines[len(t.lines)-stderrTailLines:]
+	}
+}
+
 // scanLinesOrCR is a split function for bufio.Scanner that splits on both
 // '\n' and '\r'. This handles Kopia's progress output which uses '\r' for
 // in-place updates. Based on bufio.ScanLines.
@@ -62,7 +92,7 @@ func scanLinesOrCR(data []byte, atEOF bool) (int, []byte, error) {
 // If the scanner fails (e.g., due to a line exceeding the buffer limit), we create a new
 // scanner and continue reading. This ensures the pipe keeps being drained and prevents the
 // subprocess from blocking on write.
-func streamLogs(ctx context.Context, pipe io.Reader, stream string) {
+func streamLogs(ctx context.Context, pipe io.Reader, stream string, tail *stderrTail) {
 	contextLogger := log.FromContext(ctx)
 	for {
 		scanner := bufio.NewScanner(pipe)
@@ -73,6 +103,10 @@ func streamLogs(ctx context.Context, pipe io.Reader, stream string) {
 			line := scanner.Text()
 			if line == "" {
 				continue
+			}
+
+			if tail != nil {
+				tail.add(line)
 			}
 
 			if isDiskFullMessage(line) {
@@ -165,9 +199,11 @@ func RunWithLogCapture(ctx context.Context, cmd *exec.Cmd, captureStdout io.Writ
 	// This prevents a race condition where fast commands finish before goroutines start reading.
 	var endWg sync.WaitGroup
 
-	// Stream stderr - Kopia writes all logs to stderr
+	// Stream stderr - Kopia writes all logs to stderr. The tail retains the last
+	// lines so a non-zero exit can report the actual cause.
+	tail := &stderrTail{}
 	endWg.Go(func() {
-		streamLogs(ctx, stderrPipe, "stderr")
+		streamLogs(ctx, stderrPipe, "stderr", tail)
 	})
 
 	// Wait for the goroutine to finish reading all pipe data.
@@ -177,6 +213,11 @@ func RunWithLogCapture(ctx context.Context, cmd *exec.Cmd, captureStdout io.Writ
 
 	// Reap the process. This should return quickly since EOF means the process is done.
 	if err := cmd.Wait(); err != nil {
+		if detail := tail.String(); detail != "" {
+			return fmt.Errorf("command failed: %w\nstderr (last %d lines):\n%s",
+				err, stderrTailLines, detail)
+		}
+
 		return fmt.Errorf("command failed: %w", err)
 	}
 

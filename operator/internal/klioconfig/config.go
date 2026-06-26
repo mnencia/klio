@@ -66,7 +66,7 @@ const (
 )
 
 // ClusterPlugins maps config keys to their resolved PluginConfiguration.
-// All entries are validated and filtered — only enabled Klio plugins
+// All entries are validated and filtered: only enabled Klio plugins
 // with a valid PluginConfiguration are included.
 type ClusterPlugins map[string]*kliov1alpha1.PluginConfiguration
 
@@ -137,6 +137,13 @@ func GenerateConfig(
 	if spec.Tier2 != nil {
 		klioConfig.Tier2BackupEnabled = spec.Tier2.EnableBackup
 		klioConfig.Tier2RecoveryEnabled = spec.Tier2.EnableRecovery
+	}
+
+	if spec.Backup != nil {
+		klioConfig.Backup = config.BackupConfig{
+			UseBaseBackupProtocol: spec.Backup.UseBaseBackupProtocol,
+			Incremental:           spec.Backup.Incremental,
+		}
 	}
 
 	if spec.Mode != kliov1alpha1.ModeReadOnly {

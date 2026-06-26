@@ -64,6 +64,23 @@ type Data struct {
 
 	// WALPrefetch is the WAL prefetching configuration.
 	WALPrefetch WALPrefetchConfig `json:"wal_prefetch" mapstructure:"wal_prefetch"`
+
+	// Backup configures how base backups are produced.
+	Backup BackupConfig `json:"backup" mapstructure:"backup"`
+}
+
+// BackupConfig configures how base backups are produced.
+type BackupConfig struct {
+	// UseBaseBackupProtocol sources base backups from the PostgreSQL
+	// BASE_BACKUP streaming-replication protocol and ingests them through the
+	// kopia-pgbasebackup helper, instead of snapshotting a locally-mounted
+	// PGDATA.
+	UseBaseBackupProtocol bool `json:"use_base_backup_protocol,omitempty" mapstructure:"use_base_backup_protocol"`
+
+	// Incremental enables PostgreSQL incremental base backups. It requires
+	// UseBaseBackupProtocol, PostgreSQL 17+, and summarize_wal=on on the source
+	// cluster.
+	Incremental bool `json:"incremental,omitempty" mapstructure:"incremental"`
 }
 
 // SetDefaults sets the default values of the configuration.

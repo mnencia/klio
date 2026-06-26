@@ -201,6 +201,13 @@ type PluginConfigurationTemplateOptions struct {
 	EnableTier2Recovery bool
 	// Tier2RetentionPolicy is the retention policy for tier2.
 	Tier2RetentionPolicy *kliov1alpha1.RetentionPolicy
+	// UseBaseBackupProtocol sources base backups from the PostgreSQL
+	// BASE_BACKUP streaming-replication protocol instead of snapshotting a
+	// mounted PGDATA.
+	UseBaseBackupProtocol bool
+	// Incremental enables PostgreSQL incremental base backups. Requires
+	// UseBaseBackupProtocol and summarize_wal=on on the cluster.
+	Incremental bool
 }
 
 // GetPluginConfigurationObject returns a Klio PluginConfiguration Object.
@@ -227,6 +234,13 @@ func GetPluginConfigurationObject(
 			EnableBackup:    opts.EnableTier2Backup,
 			EnableRecovery:  opts.EnableTier2Recovery,
 			RetentionPolicy: opts.Tier2RetentionPolicy,
+		}
+	}
+
+	if opts.UseBaseBackupProtocol {
+		spec.Backup = &kliov1alpha1.BackupConfiguration{
+			UseBaseBackupProtocol: true,
+			Incremental:           opts.Incremental,
 		}
 	}
 

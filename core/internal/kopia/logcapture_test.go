@@ -23,6 +23,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -30,6 +31,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestStderrTailRetainsOnlyLastLines(t *testing.T) {
+	tail := &stderrTail{}
+	total := stderrTailLines + 5
+	for i := range total {
+		tail.add(fmt.Sprintf("line-%d", i))
+	}
+
+	got := strings.Split(tail.String(), "\n")
+	require.Len(t, got, stderrTailLines)
+	// The oldest lines are dropped; the window is the last stderrTailLines.
+	assert.Equal(t, fmt.Sprintf("line-%d", total-stderrTailLines), got[0])
+	assert.Equal(t, fmt.Sprintf("line-%d", total-1), got[len(got)-1])
+}
 
 func TestRunWithLogCaptureSuccess(t *testing.T) {
 	ctx := context.Background()
@@ -49,6 +64,18 @@ func TestRunWithLogCaptureCommandFailure(t *testing.T) {
 	err := RunWithLogCapture(ctx, cmd, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "command failed")
+}
+
+func TestRunWithLogCaptureFailureIncludesStderr(t *testing.T) {
+	ctx := context.Background()
+
+	// A failing command whose stderr explains the cause must surface that cause
+	// in the returned error, not just "exit status N".
+	cmd := exec.CommandContext(ctx, "sh", "-c", "echo 'manifest not found' >&2; exit 3")
+
+	err := RunWithLogCapture(ctx, cmd, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "manifest not found")
 }
 
 func TestRunWithLogCaptureWithStdoutCapture(t *testing.T) {

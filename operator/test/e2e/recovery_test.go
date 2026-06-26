@@ -36,6 +36,12 @@ import (
 func NewRecoveryFeatureConfig(
 	name string, instances int, namespace string, useBackupID bool,
 ) machineryFeatures.RecoveryFeatureConfig {
+	return newRecoveryFeatureConfig(name, instances, namespace, useBackupID, false)
+}
+
+func newRecoveryFeatureConfig(
+	name string, instances int, namespace string, useBackupID, useBaseBackupProtocol bool,
+) machineryFeatures.RecoveryFeatureConfig {
 	const (
 		externalClusterName     = "source-cluster"
 		cnpgSourceClusterName   = "test-cluster-source"
@@ -62,9 +68,10 @@ func NewRecoveryFeatureConfig(
 		"klio-plugin-configuration",
 		namespace,
 		klio.PluginConfigurationTemplateOptions{
-			ServerCertificate: certificate,
-			ClientCertificate: userCertificate,
-			ClusterName:       cnpgSourceClusterName,
+			ServerCertificate:     certificate,
+			ClientCertificate:     userCertificate,
+			ClusterName:           cnpgSourceClusterName,
+			UseBaseBackupProtocol: useBaseBackupProtocol,
 		},
 	)
 	ageSecrets := secrets.GetKlioAgeEncryptionSecrets("encryption", namespace, "testencryptionpassword123")
@@ -155,6 +162,16 @@ func RecoverClusterFromBackupID(namespace string) *machineryFeatures.RecoveryFea
 func RecoverClusterFromLatestBackup(namespace string) *machineryFeatures.RecoveryFeature {
 	return machineryFeatures.NewRecoveryFeature(NewRecoveryFeatureConfig(
 		"RecoverClusterFromLatestBackup", 1, namespace, false))
+}
+
+// RecoverClusterViaBaseBackupProtocol takes a base backup over the PostgreSQL
+// BASE_BACKUP streaming-replication protocol (ingested by the
+// kopia-pgbasebackup helper) and recovers a cluster from it. This is the e2e
+// coverage for the opt-in protocol path; it exercises the protocol client, the
+// helper ingestion, and a full restore.
+func RecoverClusterViaBaseBackupProtocol(namespace string) *machineryFeatures.RecoveryFeature {
+	return machineryFeatures.NewRecoveryFeature(newRecoveryFeatureConfig(
+		"RecoverClusterViaBaseBackupProtocol", 1, namespace, false, true))
 }
 
 func RecoverClusterFromPitr(namespace string) *machineryFeatures.PitrFeature {

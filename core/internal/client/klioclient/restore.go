@@ -83,16 +83,21 @@ func (r *RestoreExecutor) Restore(ctx context.Context, hostname string, destinat
 		return fmt.Errorf("while restoring pgdata to %s: %w", destinationPath, err)
 	}
 
-	// Restore control data file
-	controlDataFileName := path.Join(destinationPath, controlDataPath)
-	if err := r.restorer.RestoreControlData(ctx, meta, controlDataFileName); err != nil {
-		return fmt.Errorf("while restoring control data file to %s: %w", controlDataFileName, err)
-	}
+	// On the BASE_BACKUP protocol path the restored PGDATA already contains
+	// global/pg_control and backup_label (they travel inside the tar), so we
+	// must not fetch a separate control-data snapshot or overwrite the label.
+	if !meta.SelfContainedPgData {
+		// Restore control data file
+		controlDataFileName := path.Join(destinationPath, controlDataPath)
+		if err := r.restorer.RestoreControlData(ctx, meta, controlDataFileName); err != nil {
+			return fmt.Errorf("while restoring control data file to %s: %w", controlDataFileName, err)
+		}
 
-	// Restore backup label
-	backupLabel := path.Join(destinationPath, backupLabelFileName)
-	if err := os.WriteFile(backupLabel, []byte(meta.BackupLabel), 0o600); err != nil {
-		return fmt.Errorf("while writing backup label %s file: %w", backupLabel, err)
+		// Restore backup label
+		backupLabel := path.Join(destinationPath, backupLabelFileName)
+		if err := os.WriteFile(backupLabel, []byte(meta.BackupLabel), 0o600); err != nil {
+			return fmt.Errorf("while writing backup label %s file: %w", backupLabel, err)
+		}
 	}
 
 	// Ensure pg_wal exists, since it is ignored by the backup.

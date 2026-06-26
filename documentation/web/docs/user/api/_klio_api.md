@@ -12,6 +12,23 @@ Package v1alpha1 contains API Schema definitions for the klio v1alpha1 API group
 
 
 
+#### BackupConfiguration
+
+
+
+BackupConfiguration configures how base backups are produced.
+
+
+
+_Appears in:_
+- [PluginConfigurationSpec](#pluginconfigurationspec)
+
+| Field | Description | Required | Default | Validation |
+| --- | --- | --- | --- | --- |
+| `useBaseBackupProtocol` _boolean_ | UseBaseBackupProtocol sources base backups from the PostgreSQL<br />BASE_BACKUP streaming-replication protocol and ingests them through the<br />kopia-pgbasebackup helper, instead of snapshotting a locally-mounted<br />PGDATA. This does not require the data volume to be mountable. |  |  | Optional: \{\} <br /> |
+| `incremental` _boolean_ | Incremental enables PostgreSQL incremental base backups<br />(BASE_BACKUP INCREMENTAL). It requires useBaseBackupProtocol and PostgreSQL<br />17 or newer. The source cluster must also set summarize_wal=on under<br />spec.postgresql.parameters; the plugin does not set it. When no usable<br />prior backup is available, the backup falls back to a full backup. |  |  | Optional: \{\} <br /> |
+
+
 #### CompressionAlgorithm
 
 _Underlying type:_ _string_
@@ -160,6 +177,7 @@ _Appears in:_
 | `tier1` _[Tier1PluginConfiguration](#tier1pluginconfiguration)_ | Tier1 is the Tier 1 configuration |  |  | Optional: \{\} <br /> |
 | `tier2` _[Tier2PluginConfiguration](#tier2pluginconfiguration)_ | Tier2 is the Tier 2 configuration |  |  | Optional: \{\} <br /> |
 | `walPrefetch` _[WALPrefetchConfiguration](#walprefetchconfiguration)_ | WALPrefetch configures WAL prefetching behavior during recovery operations. |  |  | Optional: \{\} <br /> |
+| `backup` _[BackupConfiguration](#backupconfiguration)_ | Backup configures how base backups are produced. |  |  | Optional: \{\} <br /> |
 | `clientSecretName` _string_ | ClientSecretName is the name of the secret containing the client credentials | True |  | MinLength: 1 <br />Required: \{\} <br /> |
 | `serverSecretName` _string_ | ServerSecretName is the name of the secret containing the server TLS certificate | True |  | MinLength: 1 <br />Required: \{\} <br /> |
 | `clusterName` _string_ | ClusterName is the name of the PostgreSQL cluster we are connecting to | True |  | MinLength: 1 <br />Required: \{\} <br /> |

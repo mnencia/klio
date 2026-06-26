@@ -113,8 +113,16 @@ The E2E tests are located in `operator/test/e2e/` and include:
 - **`recovery_test.go`** - Cluster recovery tests:
    - `RecoverClusterFromBackupID`: recovery using a specific backup ID
    - `RecoverClusterFromLatestBackup`: recovery from the latest backup
+   - `RecoverClusterViaBaseBackupProtocol`: backup over the PostgreSQL
+     BASE_BACKUP streaming-replication protocol (ingested by the
+     kopia-pgbasebackup helper), then recovery from it
    - `RecoverClusterFromPitr`: point-in-time recovery (tier1)
    - `RecoverReplicaCluster`: replica cluster creation from backup
+- **`incremental_test.go`** - incremental backup over the
+  BASE_BACKUP protocol: a full backup, then an incremental backup after
+  more data is written, then recovery from the incremental
+  (`RecoverClusterViaIncrementalBackup`). Requires `summarize_wal=on` on
+  the source cluster (PostgreSQL 17+).
 - **`tablespace_recovery_test.go`** - Recovery preserving PostgreSQL
   tablespaces (`RecoverClusterWithTablespaces`)
 - **`tier2_recovery_test.go`** - Recovery from tier2 S3 storage
