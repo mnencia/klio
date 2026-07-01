@@ -20,6 +20,9 @@ SPDX-License-Identifier: Apache-2.0
 package basebackupexec
 
 import (
+	"context"
+	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,11 +32,144 @@ import (
 	"github.com/cloudnative-pg/klio/core/internal/client/basebackup"
 	"github.com/cloudnative-pg/klio/core/internal/client/klioclient"
 	kopiaconn "github.com/cloudnative-pg/klio/core/internal/client/klioclient/kopia"
+	"github.com/cloudnative-pg/klio/core/internal/kopia"
 )
 
 // Compile-time assertion that the Kopia connection satisfies the Uploader
 // contract used by the executor.
 var _ Uploader = (*kopiaconn.Connection)(nil)
+
+// fakeUploader records the ingest options it is called with, so tests can
+// assert the per-source decisions the executor makes.
+type fakeUploader struct {
+	hostname     string
+	ingestByPath map[string]kopia.IngestOptions
+}
+
+func newFakeUploader() *fakeUploader {
+	return &fakeUploader{hostname: "cluster-a", ingestByPath: map[string]kopia.IngestOptions{}}
+}
+
+func (f *fakeUploader) GetHostname() string { return f.hostname }
+
+func (f *fakeUploader) IngestBaseBackup(
+	_ context.Context, _ io.Reader, opts kopia.IngestOptions,
+) (*kopia.IngestResult, error) {
+	f.ingestByPath[opts.SourcePath] = opts
+
+	return &kopia.IngestResult{ManifestID: "manifest-for-" + opts.SourcePath}, nil
+}
+
+func (f *fakeUploader) UploadBackupManifest(_ context.Context, _, _ string, _ []byte, _ bool) error {
+	return nil
+}
+
+func (f *fakeUploader) UploadBackupMetadata(
+	_ context.Context, _ string, _ *klioclient.BackupMetadata, _ bool,
+) error {
+	return nil
+}
+
+// TestMakeHandlerFallsBackToFullForSourceWithoutPrior is the regression test for
+// a tablespace created after the previous backup. On an incremental backup such
+// a source has no combine base, so it must be ingested as a full source rather
+// than driving the helper with --incremental and no --previous-manifest (which
+// would fail the whole backup).
+func TestMakeHandlerFallsBackToFullForSourceWithoutPrior(t *testing.T) {
+	up := newFakeUploader()
+	e := &Executor{uploader: up, clusterName: up.hostname}
+	env := &environment{
+		pgData:          "/pgdata",
+		tablespaceNames: map[string]string{"16385": "ts_old", "9999": "ts_new"},
+	}
+	opts := Options{
+		Incremental: true,
+		// The main data directory has a prior; the new tablespace does not.
+		PreviousKopiaManifests: map[string][]string{mainDataSourceKey: {"m-pgdata"}},
+	}
+
+	handler := e.makeHandler("backup-2", env, opts, map[string]string{})
+
+	// Main data directory: has a prior, so it is ingested incrementally.
+	require.NoError(t, handler(context.Background(), basebackup.DataSource{}, strings.NewReader("")))
+	main := up.ingestByPath["/pgdata"]
+	assert.True(t, main.Incremental, "main data dir must be incremental")
+	assert.Equal(t, []string{"m-pgdata"}, main.PreviousManifests)
+
+	// A tablespace with no prior manifest: full ingest, no previous manifests.
+	newTS := basebackup.DataSource{IsTablespace: true, TablespaceOID: "9999"}
+	require.NoError(t, handler(context.Background(), newTS, strings.NewReader("")))
+	ts := up.ingestByPath["/tablespace/9999"]
+	assert.False(t, ts.Incremental, "a source without a prior must be ingested as full")
+	assert.Empty(t, ts.PreviousManifests)
+}
+
+// TestMakeHandlerPerSourceIncrementalDecision exercises a single incremental
+// backup that spans several sources at once: the main data directory and two
+// tablespaces, only one of which existed in the prior backup. Each source's
+// incremental decision (and the manifests handed to the helper) must be resolved
+// independently from that source's own combine base.
+func TestMakeHandlerPerSourceIncrementalDecision(t *testing.T) {
+	up := newFakeUploader()
+	e := &Executor{uploader: up, clusterName: up.hostname}
+	env := &environment{
+		pgData:          "/pgdata",
+		tablespaceNames: map[string]string{"16385": "ts_old", "9999": "ts_new"},
+	}
+	opts := Options{
+		Incremental: true,
+		PreviousKopiaManifests: map[string][]string{
+			mainDataSourceKey:   {"m-pgdata"},
+			"/tablespace/16385": {"m-ts-old"},
+			// "/tablespace/9999" intentionally absent: created after the prior backup.
+		},
+	}
+
+	handler := e.makeHandler("backup-2", env, opts, map[string]string{})
+
+	sources := []basebackup.DataSource{
+		{}, // main data directory
+		{IsTablespace: true, TablespaceOID: "16385"},
+		{IsTablespace: true, TablespaceOID: "9999"},
+	}
+	for _, src := range sources {
+		require.NoError(t, handler(context.Background(), src, strings.NewReader("")))
+	}
+
+	cases := []struct {
+		path            string
+		wantIncremental bool
+		wantManifests   []string
+	}{
+		{"/pgdata", true, []string{"m-pgdata"}},
+		{"/tablespace/16385", true, []string{"m-ts-old"}},
+		{"/tablespace/9999", false, nil},
+	}
+	for _, tc := range cases {
+		got := up.ingestByPath[tc.path]
+		assert.Equal(t, tc.wantIncremental, got.Incremental, "Incremental for %s", tc.path)
+		assert.Equal(t, tc.wantManifests, got.PreviousManifests, "PreviousManifests for %s", tc.path)
+	}
+}
+
+func TestValidateIncrementalPreconditions(t *testing.T) {
+	t.Run("server older than PostgreSQL 17 is rejected", func(t *testing.T) {
+		env := &environment{serverVersionNum: 160004}
+		err := validateIncrementalPreconditions(env, Options{PreviousManifest: []byte("m")})
+		require.ErrorIs(t, err, ErrIncrementalRequiresPG17)
+	})
+
+	t.Run("missing previous manifest is rejected", func(t *testing.T) {
+		env := &environment{serverVersionNum: 170004}
+		err := validateIncrementalPreconditions(env, Options{})
+		require.ErrorIs(t, err, ErrIncrementalRequiresManifest)
+	})
+
+	t.Run("PostgreSQL 17 with a manifest is accepted", func(t *testing.T) {
+		env := &environment{serverVersionNum: 170000}
+		require.NoError(t, validateIncrementalPreconditions(env, Options{PreviousManifest: []byte("m")}))
+	})
+}
 
 func TestSourceDescriptor(t *testing.T) {
 	env := &environment{

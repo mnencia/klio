@@ -122,7 +122,10 @@ The E2E tests are located in `operator/test/e2e/` and include:
   BASE_BACKUP protocol: a full backup, then an incremental backup after
   more data is written, then recovery from the incremental
   (`RecoverClusterViaIncrementalBackup`). Requires `summarize_wal=on` on
-  the source cluster (PostgreSQL 17+).
+  the source cluster (PostgreSQL 17+). Also
+  `IncrementalFallsBackWithoutSummaries`: the negative path, where a
+  cluster with `summarize_wal` off makes an incremental request fall back
+  to a full backup instead of failing.
 - **`tablespace_recovery_test.go`** - Recovery preserving PostgreSQL
   tablespaces (`RecoverClusterWithTablespaces`)
 - **`tier2_recovery_test.go`** - Recovery from tier2 S3 storage

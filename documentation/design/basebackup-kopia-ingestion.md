@@ -215,13 +215,13 @@ seek within, so it cannot read from a one-way pipe.
    deduplicates blocks on its own). This yields an object ID and a directory
    entry that carries the metadata from the tar header (name, type, size, mode,
    modification time, and ownership).
-2. Each entry is added to a per-directory builder, held in a map keyed by
+1. Each entry is added to a per-directory builder, held in a map keyed by
    directory path. Parent directories are created on demand, so a member can
    arrive before its own directory member.
-3. At the end of the stream the directories are finalized deepest first. Each
+1. At the end of the stream the directories are finalized deepest first. Each
    directory listing is written to an object and added as an entry in its
    parent, so every child is written before its parent.
-4. The root is saved with `SaveSnapshot`, and the result JSON is printed.
+1. The root is saved with `SaveSnapshot`, and the result JSON is printed.
 
 Because every directory builder is kept until the end, the helper accepts
 members in any order, including `pg_basebackup` sending `global/pg_control`
@@ -254,9 +254,16 @@ restore uses that flag to pick the right path.
 
 ### Prerequisites
 
-- `summarize_wal = on` on the source server, with WAL summaries that cover the
-  range since the prior backup. If the summaries have aged out, the server
-  cannot produce an incremental, and Klio falls back to a full backup.
+- `summarize_wal = on` on the source server, with WAL summaries that still cover
+  the range since the prior backup. PostgreSQL prunes summaries after
+  [`wal_summary_keep_time`][pg-wal-summary-keep-time] (10 days by default). Before
+  requesting an incremental, Klio checks that the summary covering the prior
+  backup's start LSN is still present (via `pg_available_wal_summaries()`); if it
+  has been pruned, an auto-detected prior falls back to a full backup and an
+  explicitly named prior fails with a clear error. This mirrors the server-side
+  requirement described in [Making an Incremental Backup][pg-incremental]: "if
+  the necessary files have already been removed [...] the incremental backup will
+  fail".
 - A stored `backup_manifest` from the prior backup. Every backup captures one
   via `MANIFEST 'yes'`.
 
@@ -267,9 +274,9 @@ the user.
 ### Protocol flow
 
 1. `UPLOAD_MANIFEST`: send the prior backup's `backup_manifest`.
-2. `BASE_BACKUP INCREMENTAL`: the same options as a full backup, plus the
+1. `BASE_BACKUP INCREMENTAL`: the same options as a full backup, plus the
    incremental request, on the same replication connection.
-3. Store the new `backup_manifest` for the next incremental.
+1. Store the new `backup_manifest` for the next incremental.
 
 ### Incremental file format
 
@@ -427,6 +434,21 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
 - WAL receiver (the model for the protocol client):
   `core/internal/client/sendwal/receiver.go`.
 - Build: `core/Dockerfile`.
-- PostgreSQL references: `src/backend/backup/basebackup_incremental.c`
+- PostgreSQL source references: `src/backend/backup/basebackup_incremental.c`
   (incremental writer), `src/bin/pg_combinebackup/reconstruct.c` (reader), and
   `pg_basebackup` (`receivelog.c`, `bbstreamer_*`).
+- PostgreSQL documentation: [Making an Incremental Backup][pg-incremental],
+  [`pg_basebackup --incremental`][pg-basebackup],
+  [`pg_combinebackup`][pg-combinebackup] and its
+  [limitations][pg-combinebackup-limits], the [`summarize_wal`][pg-summarize-wal]
+  and [`wal_summary_keep_time`][pg-wal-summary-keep-time] settings, and the
+  [WAL summarization functions][pg-wal-summary-funcs]
+  (`pg_available_wal_summaries()`).
+
+[pg-incremental]: https://www.postgresql.org/docs/current/continuous-archiving.html#BACKUP-INCREMENTAL-BACKUP
+[pg-basebackup]: https://www.postgresql.org/docs/current/app-pgbasebackup.html
+[pg-combinebackup]: https://www.postgresql.org/docs/current/app-pgcombinebackup.html
+[pg-combinebackup-limits]: https://www.postgresql.org/docs/current/app-pgcombinebackup.html#APP-PGCOMBINEBACKUP-LIMITATIONS
+[pg-summarize-wal]: https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-SUMMARIZE-WAL
+[pg-wal-summary-keep-time]: https://www.postgresql.org/docs/current/runtime-config-wal.html#GUC-WAL-SUMMARY-KEEP-TIME
+[pg-wal-summary-funcs]: https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-BACKUP

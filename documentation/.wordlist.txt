@@ -341,6 +341,7 @@ str
 subdirectories
 subdirectory
 subprocess
+summarization
 symlinks
 tablespace
 tablespace's

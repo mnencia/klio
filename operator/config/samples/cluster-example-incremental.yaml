@@ -1,0 +1,82 @@
+# Incremental base backup over the PostgreSQL BASE_BACKUP streaming protocol.
+#
+# This sample enables Klio's BASE_BACKUP protocol path together with PostgreSQL
+# native incremental backups (PostgreSQL 17+). It reuses the Server, CA issuer
+# and encryption secret from klio_v1alpha1_server.yaml, so apply that first:
+#
+#   kubectl apply -k operator/config/samples          # Server + CA + TLS
+#   kubectl apply -f operator/config/samples/cluster-example-incremental.yaml
+#
+# Requirements for incremental backups:
+#   - PostgreSQL 17 or newer.
+#   - summarize_wal = on on the cluster (set below); Klio does not set it for you.
+#
+# The first backup is always full (no prior exists yet); later backups reuse the
+# most recent one as the combine base. If no usable prior is found -- or its WAL
+# summaries have already been pruned (see wal_summary_keep_time) -- Klio
+# transparently falls back to a full backup.
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: cluster-example-incremental
+spec:
+  instances: 1
+  imagePullPolicy: Always
+
+  postgresql:
+    parameters:
+      # Required for PostgreSQL native incremental backups. This is a
+      # cluster-side setting; Klio does not enable it for you.
+      summarize_wal: "on"
+    pg_hba:
+      - local replication all peer map=local
+
+  plugins:
+    - name: klio.cnpg.io
+      enabled: true
+      parameters:
+        pluginConfigurationRef: client-config-example-incremental
+
+  storage:
+    size: 1Gi
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: cluster-example-incremental-klio-user
+spec:
+  # The CN must be <userName>@<clusterName>, and clusterName must match the
+  # PluginConfiguration below (and the hostname the Klio server trusts).
+  commonName: klio@cluster-example-incremental
+  secretName: cluster-example-incremental-klio-user
+
+  duration: 2160h # 90d
+  renewBefore: 360h # 15d
+
+  isCA: false
+  usages:
+    - client auth
+
+  issuerRef:
+    name: server-sample-ca
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: klio.cnpg.io/v1alpha1
+kind: PluginConfiguration
+metadata:
+  name: client-config-example-incremental
+spec:
+  serverAddress: server-sample.default
+  clientSecretName: cluster-example-incremental-klio-user
+  serverSecretName: server-sample-tls
+  clusterName: cluster-example-incremental
+  # Opt in to the BASE_BACKUP protocol path and request incremental backups.
+  # An explicit CLI flag on `klio backup run` would override these.
+  backup:
+    useBaseBackupProtocol: true
+    incremental: true
+  tier1:
+    retention:
+      keepAnnual: 1

@@ -38,6 +38,21 @@ var ErrIncrementalRequiresPG17 = errors.New("incremental backup requires Postgre
 // supports incremental BASE_BACKUP.
 const pg17VersionNum = 170000
 
+// validateIncrementalPreconditions checks that an incremental backup can run
+// against the given environment: the server must be PostgreSQL 17 or newer and a
+// prior backup_manifest must be available to upload.
+func validateIncrementalPreconditions(env *environment, opts Options) error {
+	if env.serverVersionNum < pg17VersionNum {
+		return fmt.Errorf("%w: server reports version %d",
+			ErrIncrementalRequiresPG17, env.serverVersionNum)
+	}
+	if len(opts.PreviousManifest) == 0 {
+		return ErrIncrementalRequiresManifest
+	}
+
+	return nil
+}
+
 // environment holds metadata that the BASE_BACKUP protocol does not provide and
 // that must be read from a standard SQL connection.
 type environment struct {

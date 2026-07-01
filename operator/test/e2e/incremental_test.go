@@ -89,6 +89,13 @@ func (f *incrementalRecoveryFeature) Run() types.StepFunc {
 			wait.For(machineryConditions.BackupIsCompleted(r, f.fullBackup), backupTimeout, backupInterval),
 			"full backup not completed")
 
+		// The first backup requested incremental too, but no prior exists yet, so
+		// it must have fallen back to a full backup rather than failing.
+		fullLogs, err := pods.GetLogs(ctx, r, src, cnpgi.KlioPluginContainerName)
+		require.NoError(t, err, "failed to get klio-plugin logs after full backup")
+		require.Contains(t, fullLogs, "no previous backup exists",
+			"first backup did not fall back to a full backup")
+
 		// Second data set, then an incremental backup against the prior one.
 		_, err = postgres.ExecPostgresQuery(ctx, r, src, "postgres",
 			"CREATE TABLE t2 AS SELECT generate_series(1, 500) AS y;")
@@ -239,5 +246,151 @@ func RecoverClusterViaIncrementalBackup(namespace string) *incrementalRecoveryFe
 		incrementalBackup: incrementalBackup,
 		recoveryCluster:   recoveryCluster,
 		mutate:            []machineryFeatures.RecoveryClusterMutateFunc{mutators.CreateBackupIDMutator(incrementalBackup)},
+	}
+}
+
+// summariesUnavailableFallbackFeature verifies the deterministic negative path of
+// incremental backup: when the source cluster keeps no WAL summaries
+// (summarize_wal is off), an incremental request with an otherwise-usable prior
+// cannot be satisfied, so klio falls back to a full backup instead of failing.
+// It needs no recovery cluster: it asserts on the backup outcome and the plugin
+// log, not on a restore.
+type summariesUnavailableFallbackFeature struct {
+	name         string
+	scenario     *commonBackupRestoreScenario
+	firstBackup  *cnpgv1.Backup
+	secondBackup *cnpgv1.Backup
+}
+
+func (f *summariesUnavailableFallbackFeature) Name() string             { return f.name }
+func (f *summariesUnavailableFallbackFeature) Setup() types.StepFunc    { return f.scenario.Setup }
+func (f *summariesUnavailableFallbackFeature) Teardown() types.StepFunc { return f.scenario.Teardown }
+
+func (f *summariesUnavailableFallbackFeature) Run() types.StepFunc {
+	return func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+		t.Helper()
+		t.Log("Running incremental fallback (no WAL summaries) feature test")
+
+		r, err := resources.New(cfg.Client().RESTConfig())
+		require.NoError(t, err, "failed to create resources client")
+		src := &f.scenario.sourcePrimaryPod
+
+		backupTimeout := wait.WithTimeout(3 * time.Minute)
+		backupInterval := wait.WithInterval(10 * time.Second)
+
+		// First data set, then a full backup. Incremental is requested but no
+		// prior exists yet, so this one falls back to a full backup.
+		_, err = postgres.ExecPostgresQuery(ctx, r, src, "postgres",
+			"CREATE TABLE t1 AS SELECT generate_series(1, 1000) AS x;")
+		require.NoError(t, err, "failed to create table t1")
+		require.NoError(t, postgres.CheckpointAndSwitchWal(ctx, r, src), "failed to checkpoint/switch WAL (1)")
+
+		require.NoError(t, r.Create(ctx, f.firstBackup), "failed to create first backup")
+		require.NoError(t,
+			wait.For(machineryConditions.BackupIsCompleted(r, f.firstBackup), backupTimeout, backupInterval),
+			"first backup not completed")
+
+		// Second data set, then a second backup. A usable prior now exists, but the
+		// source cluster keeps no WAL summaries (summarize_wal is off), so the
+		// incremental cannot be produced.
+		_, err = postgres.ExecPostgresQuery(ctx, r, src, "postgres",
+			"CREATE TABLE t2 AS SELECT generate_series(1, 500) AS y;")
+		require.NoError(t, err, "failed to create table t2")
+		require.NoError(t, postgres.CheckpointAndSwitchWal(ctx, r, src), "failed to checkpoint/switch WAL (2)")
+
+		require.NoError(t, r.Create(ctx, f.secondBackup), "failed to create second backup")
+		require.NoError(t,
+			wait.For(machineryConditions.BackupIsCompleted(r, f.secondBackup), backupTimeout, backupInterval),
+			"second backup not completed")
+
+		// Assert on the Backup CR status. With summarize_wal off the server cannot
+		// produce an incremental BASE_BACKUP, so had the pre-check not fallen back
+		// to a full backup, the incremental would have failed and the Backup would
+		// be in the Failed phase. Reaching Completed is therefore the proof that the
+		// incremental request degraded to a full backup.
+		var secondBackup cnpgv1.Backup
+		require.NoError(t,
+			r.Get(ctx, f.secondBackup.Name, f.secondBackup.Namespace, &secondBackup),
+			"failed to get the second backup")
+		require.Equal(t, cnpgv1.BackupPhaseCompleted, string(secondBackup.Status.Phase),
+			"the incremental request should have fallen back to a completed full backup")
+
+		return ctx
+	}
+}
+
+// IncrementalFallsBackWithoutSummaries is the incremental fallback e2e feature.
+func IncrementalFallsBackWithoutSummaries(namespace string) *summariesUnavailableFallbackFeature {
+	const cnpgSourceClusterName = "test-cluster-nosummaries"
+
+	namespaceObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+
+	issuer := certificates.GetSelfSignedIssuerObject("selfsigned-issuer", namespace)
+	certificate := certificates.GetCertificateObject("test", namespace, []string{klioServerName}, issuer)
+	caCertificate := certificates.GetCACertificateObject("test-ca", namespace, issuer)
+	caIssuer := certificates.GetCAIssuerObject("test-ca-issuer", namespace, caCertificate.Spec.SecretName)
+
+	// summarize_wal is deliberately left off (the default): the cluster keeps no
+	// WAL summaries, so an incremental request cannot be satisfied and must fall
+	// back to a full backup.
+	cnpgCluster := cnpg.GetCnpgClusterObject(cnpgSourceClusterName, namespace, 1, "klio-plugin-configuration",
+		cnpg.ClusterTemplateOptions{
+			StorageClass: testCfg.StorageClass,
+		})
+
+	userCertificate := certificates.GetUserCertificateObject("klio-user", namespace,
+		"klio-user@"+cnpgSourceClusterName, caIssuer)
+	klioPluginConfigurationSource := klio.GetPluginConfigurationObject(
+		"klio-plugin-configuration",
+		namespace,
+		klio.PluginConfigurationTemplateOptions{
+			ServerCertificate:     certificate,
+			ClientCertificate:     userCertificate,
+			ClusterName:           cnpgSourceClusterName,
+			UseBaseBackupProtocol: true,
+			Incremental:           true,
+		},
+	)
+	ageSecrets := secrets.GetKlioAgeEncryptionSecrets("encryption", namespace, "testencryptionpassword123")
+	klioServer := klio.GetServerObject(
+		klioServerName,
+		namespace,
+		klio.ServerTemplateOptions{
+			Image:              testCfg.ServerImage,
+			StorageClass:       testCfg.StorageClass,
+			TLSSecretName:      certificate.Spec.SecretName,
+			ClientCASecretName: caCertificate.Spec.SecretName,
+			Encryption: klio.EncryptionOptions{
+				EncryptionKeySecretName: ageSecrets.EncryptionKeySecret.Name,
+				EncryptionKeyFileName:   "encryption-key.age",
+				IdentitySecretName:      ageSecrets.IdentitySecret.Name,
+				IdentityFileName:        "identity.txt",
+			},
+		},
+	)
+
+	firstBackup := cnpg.GetCnpgBackupObject("test-backup-nosum-1", namespace, cnpgv1.DefaultBackupTarget, cnpgCluster)
+	secondBackup := cnpg.GetCnpgBackupObject("test-backup-nosum-2", namespace, cnpgv1.DefaultBackupTarget, cnpgCluster)
+
+	scenario := &commonBackupRestoreScenario{
+		namespace:                     namespaceObj,
+		cnpgCluster:                   cnpgCluster,
+		userCertificate:               userCertificate,
+		encryptionSecret:              ageSecrets.EncryptionKeySecret,
+		identitySecret:                ageSecrets.IdentitySecret,
+		issuer:                        issuer,
+		caIssuer:                      caIssuer,
+		caCertificate:                 caCertificate,
+		certificate:                   certificate,
+		klioServer:                    klioServer,
+		klioPluginConfigurationSource: klioPluginConfigurationSource,
+		name:                          "IncrementalFallsBackWithoutSummaries",
+	}
+
+	return &summariesUnavailableFallbackFeature{
+		name:         "IncrementalFallsBackWithoutSummaries",
+		scenario:     scenario,
+		firstBackup:  firstBackup,
+		secondBackup: secondBackup,
 	}
 }

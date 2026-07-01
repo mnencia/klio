@@ -118,7 +118,8 @@ func parseIngestFlags(args []string) (*ingestFlags, error) {
 	)
 	fs.Var(&tags, "tag", "snapshot tag key=value (repeatable)")
 	fs.Var(&pins, "pin", "snapshot retention pin (repeatable)")
-	fs.Var(&prevManis, "previous-manifest", "prior snapshot manifest ID for incremental combine (repeatable)")
+	fs.Var(&prevManis, "previous-manifest",
+		"prior snapshot manifest ID for incremental combine (repeatable; only the first is used)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err //nolint:wrapcheck
@@ -205,6 +206,10 @@ func ingestIntoRepo(ctx context.Context, rep repo.Repository, f *ingestFlags) (*
 // buildPriorImage loads the prior snapshot referenced by the first
 // previous-manifest and exposes its tree for incremental reconstruction.
 //
+// The flag is repeatable for forward compatibility, but a single source is
+// combined against exactly one prior snapshot (the depth-1 invariant), so only
+// the first manifest is used; any others are ignored.
+//
 //nolint:ireturn // returns the PriorImage abstraction by design
 func buildPriorImage(ctx context.Context, rep repo.Repository, prevManis stringList) (ingest.PriorImage, error) {
 	if len(prevManis) == 0 {
@@ -223,6 +228,13 @@ func buildPriorImage(ctx context.Context, rep repo.Repository, prevManis stringL
 }
 
 func emitResult(result *ingest.Result, uploaded int64) error {
+	// These byte counts are an approximation, not an exact accounting. uploaded
+	// is the number of bytes written to the blob store (post-compression,
+	// post-dedup), reported as hashedBytes; TotalSize is the logical size of the
+	// ingested files. cachedBytes is their difference, clamped at zero. Because
+	// the two are measured on different sides of compression they are not
+	// strictly comparable; the ratio is only meant as a signal of how effective
+	// deduplication was for this ingest, not an exact cache-hit byte count.
 	cached := max(result.Stats.TotalSize-uploaded, 0)
 
 	out := ingestOutput{

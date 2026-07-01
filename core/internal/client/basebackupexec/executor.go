@@ -125,12 +125,8 @@ func (e *Executor) Run(ctx context.Context, opts Options) (*klioclient.BackupMet
 	}
 
 	if opts.Incremental {
-		if env.serverVersionNum < pg17VersionNum {
-			return nil, fmt.Errorf("%w: server reports version %d",
-				ErrIncrementalRequiresPG17, env.serverVersionNum)
-		}
-		if len(opts.PreviousManifest) == 0 {
-			return nil, ErrIncrementalRequiresManifest
+		if err := validateIncrementalPreconditions(env, opts); err != nil {
+			return nil, err
 		}
 		contextLogger.Info("Uploading prior manifest for incremental backup")
 		if uErr := basebackup.UploadManifest(ctx, e.repConn, opts.PreviousManifest); uErr != nil {
@@ -190,12 +186,20 @@ func (e *Executor) makeHandler(
 	return func(ctx context.Context, src basebackup.DataSource, tar io.Reader) error {
 		key, sourcePath, tags := sourceDescriptor(src, name, env)
 
+		// Incremental is decided per source, not per backup. A source that has no
+		// prior combine base (for example a tablespace created after the previous
+		// backup) is ingested as a full source even during an incremental backup:
+		// PostgreSQL streams its files in full, and passing --incremental with no
+		// --previous-manifest would fail the helper.
+		previousManifests := opts.PreviousKopiaManifests[key]
+		srcIncremental := opts.Incremental && len(previousManifests) > 0
+
 		ingestOpts := kopia.IngestOptions{
 			SourcePath:        sourcePath,
 			Tags:              tags,
 			Pins:              pins,
-			Incremental:       opts.Incremental,
-			PreviousManifests: opts.PreviousKopiaManifests[key],
+			Incremental:       srcIncremental,
+			PreviousManifests: previousManifests,
 		}
 
 		res, err := e.uploader.IngestBaseBackup(ctx, tar, ingestOpts)
