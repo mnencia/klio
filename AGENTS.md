@@ -243,6 +243,32 @@ exists today; this is a guardrail for the future). Pick identity by use:
   re-listing (`DeleteBackup`; reused by the sweeper's
   `sweepCluster`/`sweepOrphans`).
 
+### `kopia-pgbasebackup` ingestion helper
+
+`core/kopia-pgbasebackup` is a separate, nested Go module (its own `go.mod` and
+`.golangci.yml`). It assembles a Kopia snapshot directly from a PostgreSQL
+`BASE_BACKUP` tar stream, so the Kopia library stays out of the main `klio`
+binary. It imports Kopia under the canonical path `github.com/kopia/kopia` with a
+`replace` directive pointing at the `cloudnative-pg/kopia` fork (branch `klio`);
+drop the `replace` once the patches merge upstream. The design is in
+`documentation/design/basebackup-kopia-ingestion.md`.
+
+Because Go does not descend into nested modules, `task core:lint` and
+`task core:go-test` do not cover it. CI does cover it through the dedicated
+`task core:kopia-pgbasebackup:lint` and `task core:kopia-pgbasebackup:go-test`
+tasks (both run as part of `task core:ci`). When iterating locally, build, test,
+and lint it on its own:
+
+```bash
+cd core/kopia-pgbasebackup
+go build ./... && go test ./... && golangci-lint run ./...
+```
+
+This path is opt-in: enable it with the `klio backup run` flag
+`--use-base-backup-protocol` (plus `--incremental` for PostgreSQL 17+), or the
+config `backup.use_base_backup_protocol`. By default klio snapshots a
+locally-mounted `PGDATA` as before.
+
 ### Dagger caching issues
 
 When running e2e tests, Dagger may cache Helm repo indexes. If a new version of
@@ -273,6 +299,9 @@ cached index, run tests, then revert.
 - Before committing, run:
   - `golangci-lint run` in `core/`
   - `golangci-lint run` in `operator/`
+  - if you touched `core/kopia-pgbasebackup/`, also `go test ./...` and
+    `golangci-lint run ./...` inside that module (it is a separate nested module
+    that `core/` and `dagger call all-ci` do not reach)
   - `dagger call all-ci`
 
 ## Key Dependencies

@@ -100,6 +100,8 @@ tasks:
       - core:protolint
       - core:protoc-gen-go-grpc
       - core:go-test
+      - core:kopia-pgbasebackup:lint
+      - core:kopia-pgbasebackup:go-test
       - core:containerize-snapshot
       - core:uncommitted
 
@@ -162,6 +164,27 @@ tasks:
           WORKDIR: "core"
     sources:
       - core/**/*.go
+
+  # core/kopia-pgbasebackup is a separate nested Go module (its own go.mod), so
+  # Go tooling run from core/ does not descend into it. Lint and test it
+  # explicitly so the BASE_BACKUP ingestion helper is covered by CI.
+  core:kopia-pgbasebackup:lint:
+    desc: Run golangci-lint on the kopia-pgbasebackup helper module
+    cmds:
+      - task: internal:lint
+        vars:
+          WORKDIR: "core/kopia-pgbasebackup"
+    sources:
+      - core/kopia-pgbasebackup/**/*.go
+
+  core:kopia-pgbasebackup:go-test:
+    desc: Run go test on the kopia-pgbasebackup helper module
+    cmds:
+      - task: internal:go-test
+        vars:
+          WORKDIR: "core/kopia-pgbasebackup"
+    sources:
+      - core/kopia-pgbasebackup/**/*.go
 
   core:goreleaser-snapshot:
     desc: Build snapshot packages

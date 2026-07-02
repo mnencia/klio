@@ -31,6 +31,10 @@ type ClusterTemplateOptions struct {
 	// StorageClass is the storage class for the cluster's data (and tablespace)
 	// PVCs. If empty, the cluster's default storage class is used.
 	StorageClass string
+	// Parameters are extra PostgreSQL parameters to set on the cluster (e.g.
+	// summarize_wal for incremental backups). Merged into the cluster's
+	// postgresql.parameters.
+	Parameters map[string]string
 }
 
 // GetCnpgClusterObject returns a CNPG Cluster Object.
@@ -68,6 +72,10 @@ func GetCnpgClusterObject(
 
 	if opts.StorageClass != "" {
 		cluster.Spec.StorageConfiguration.StorageClass = new(opts.StorageClass)
+	}
+
+	if len(opts.Parameters) > 0 {
+		cluster.Spec.PostgresConfiguration.Parameters = opts.Parameters
 	}
 
 	return cluster

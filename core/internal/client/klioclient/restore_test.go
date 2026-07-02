@@ -319,3 +319,40 @@ func TestRestoreExecutorRestore(t *testing.T) {
 	require.NoError(t, err, "pg_wal directory should be created")
 	assert.True(t, stat.IsDir())
 }
+
+func TestRestoreExecutorRestoreSelfContained(t *testing.T) {
+	ctx := context.Background()
+
+	tempDir := t.TempDir()
+	mock := newMockRestorer()
+
+	// On the BASE_BACKUP protocol path the tar already carries backup_label and
+	// global/pg_control, so SelfContainedPgData is set. Even with a BackupLabel
+	// in the metadata, restore must NOT fetch a separate control-data snapshot
+	// nor write/overwrite the label.
+	meta := &BackupMetadata{
+		Name:                "test-backup",
+		BackupLabel:         "stale-label-must-not-be-written",
+		SelfContainedPgData: true,
+	}
+	mock.metadataToReturn = meta
+
+	conf := RestoreConfiguration{Name: "test-backup", PgDataDirectory: tempDir}
+	executor := NewRestoreExecutor(mock, conf)
+
+	err := executor.Restore(ctx, "", tempDir)
+	require.NoError(t, err)
+
+	assert.True(t, mock.restorePgDataCalled)
+	assert.False(t, mock.restoreControlCalled, "control data must not be fetched on the self-contained path")
+
+	// The label must not be written: it travels inside the restored tree.
+	labelPath := path.Join(tempDir, backupLabelFileName)
+	_, statErr := os.Stat(labelPath)
+	assert.True(t, os.IsNotExist(statErr), "backup_label must not be written on the self-contained path")
+
+	// pg_wal is still ensured.
+	stat, err := os.Stat(path.Join(tempDir, "pg_wal"))
+	require.NoError(t, err)
+	assert.True(t, stat.IsDir())
+}

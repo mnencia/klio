@@ -45,6 +45,26 @@ type Connection struct {
 	userName    string
 
 	kopia *kopia.Client
+
+	// pgBaseBackup wraps the kopia-pgbasebackup helper used to ingest a
+	// BASE_BACKUP tar stream. It is nil when the helper is not installed; the
+	// filesystem-snapshot path does not need it.
+	pgBaseBackup *kopia.PgBaseBackupClient
+}
+
+// newPgBaseBackupClient builds a helper client, returning nil (best effort) when
+// the kopia-pgbasebackup binary is not present in PATH.
+func newPgBaseBackupClient(configFile, password string) *kopia.PgBaseBackupClient {
+	binary, err := kopia.LookupPgBaseBackupBinary()
+	if err != nil {
+		return nil
+	}
+
+	return &kopia.PgBaseBackupClient{
+		Binary:     binary,
+		ConfigFile: configFile,
+		Password:   password,
+	}
 }
 
 // CleanupConfigFile removes the Kopia configuration file and its associated password file.
@@ -87,6 +107,7 @@ func FromKopiaConfig(configFile string) (*Connection, error) {
 			ConfigFile:  configFile,
 			KopiaBinary: kopiaBinary,
 		},
+		pgBaseBackup: newPgBaseBackupClient(configFile, ""),
 	}, nil
 }
 
@@ -198,6 +219,7 @@ func connectToKopiaServer(
 			ConfigFile:  configFile.Name(),
 			Password:    "mtls",
 		},
+		pgBaseBackup: newPgBaseBackupClient(configFile.Name(), "mtls"),
 	}, nil
 }
 

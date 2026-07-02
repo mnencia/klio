@@ -117,8 +117,27 @@ The E2E tests are located in `operator/test/e2e/` and include:
 - **`recovery_test.go`** - Cluster recovery tests:
    - `RecoverClusterFromBackupID`: recovery using a specific backup ID
    - `RecoverClusterFromLatestBackup`: recovery from the latest backup
+   - `RecoverClusterViaBaseBackupProtocol`: backup over the PostgreSQL
+     BASE_BACKUP streaming-replication protocol (ingested by the
+     kopia-pgbasebackup helper), then recovery from it
    - `RecoverClusterFromPitr`: point-in-time recovery (tier1)
    - `RecoverReplicaCluster`: replica cluster creation from backup
+- **`incremental_test.go`** - incremental backup over the
+  BASE_BACKUP protocol: a full backup, then an incremental backup after
+  more data is written, then recovery from the incremental
+  (`RecoverClusterViaIncrementalBackup`). Requires `summarize_wal=on` on
+  the source cluster (PostgreSQL 17+). Also
+  `IncrementalFallsBackWithoutSummaries`: the negative path, where a
+  cluster with `summarize_wal` off makes an incremental request fall back
+  to a full backup instead of failing.
+- **`incremental_tablespace_test.go`** - the per-source incremental
+  decision (`RecoverClusterViaIncrementalWithNewTablespace`, serial): a
+  tablespace is added to the source cluster only after the full backup,
+  so on the incremental backup the main data directory is ingested
+  incrementally while the new tablespace is ingested as a full source.
+  The recovery then verifies both data sets are present. Each backup's
+  method (full or incremental) is asserted on the Backup resource's
+  `.status.pluginMetadata` (`klio.io/backup-method`) rather than on logs.
 - **`tablespace_recovery_test.go`** - Recovery preserving PostgreSQL
   tablespaces (`RecoverClusterWithTablespaces`)
 - **`tier2_recovery_test.go`** - Recovery from tier2 S3 storage

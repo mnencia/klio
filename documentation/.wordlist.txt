@@ -1,6 +1,7 @@
 ACLs
 AES
 APIs
+BackupConfiguration
 BackupID
 BackupManifest
 Benchmarking
@@ -9,6 +10,7 @@ BucketName
 ByteString
 CAs
 CLI
+CN
 CNP
 CNPG
 CRC
@@ -45,6 +47,7 @@ EncryptionKeyFile
 EndpointSlices
 Enum
 ExactlyOneOf
+FSM
 FailedBackup
 FailedWAL
 FalseClass
@@ -88,6 +91,7 @@ KlioAPI
 Kopia
 Kopia's
 Kubernetes
+LSNs
 LVM
 ListBackups
 ListBackupsRequest
@@ -186,6 +190,7 @@ StatefulSet's
 StatefulSets
 StorageClass
 StorageClasses
+TLI
 TLS
 TLSConfiguration
 TLSSecretName
@@ -201,6 +206,8 @@ UIDs
 UTF
 Unreferenced
 UpDownCounter
+UseBaseBackupProtocol
+VM
 Veeam
 Velero
 VolumeClaimTemplates
@@ -244,8 +251,10 @@ datacenter
 datacenters
 decrypt
 decrypted
+deduplicate
 deduplicated
 deduplicates
+deduplicating
 deduplication
 deflate
 deployable
@@ -270,6 +279,7 @@ http
 https
 imagePullPolicy
 imagePullSecrets
+incrementals
 init
 io
 keychain
@@ -302,6 +312,9 @@ observability
 opentelemetry
 otel
 otlp
+pgbasebackup
+pglogrepl
+pgx
 pgzip
 plaintext
 pluginConfigurationRef
@@ -334,10 +347,16 @@ serviceAccountName
 sfixed
 sint
 snapshotted
+snapshotting
+stderr
 str
 subdirectories
 subdirectory
 subprocess
+summarization
+symlinks
+tablespace
+tablespace's
 tablespaces
 teardown
 tolerations
@@ -346,8 +365,11 @@ uint
 ulong
 unicode
 unreferenced
+unrestorable
 unupgradable
+uploader
 uptime
+useBaseBackupProtocol
 verifications
 wal
 wals
