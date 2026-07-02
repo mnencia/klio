@@ -266,8 +266,8 @@ func RecoverClusterViaIncrementalBackup(namespace string) *incrementalRecoveryFe
 // incremental backup: when the source cluster keeps no WAL summaries
 // (summarize_wal is off), an incremental request with an otherwise-usable prior
 // cannot be satisfied, so klio falls back to a full backup instead of failing.
-// It needs no recovery cluster: it asserts on the backup outcome and the plugin
-// log, not on a restore.
+// It needs no recovery cluster: it asserts on the backup outcome and the
+// recorded backup method (plugin metadata), not on a restore.
 type summariesUnavailableFallbackFeature struct {
 	name         string
 	scenario     *commonBackupRestoreScenario
