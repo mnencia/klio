@@ -252,6 +252,41 @@ what the operation does:
   anyway on the next tier2 migration — it is not a safe pattern to copy for
   anything that isn't equally tolerant of that collision.
 
+### Cobra/viper CLI command conventions
+
+All CLI commands (`klio` itself and the `kopia-pgbasebackup` helper) use
+`spf13/cobra` for command structure and `spf13/viper` only for specific,
+narrow purposes — not as a general flag-binding layer.
+
+- One `*cobra.Command` package-level var per command group (e.g. `BackupCmd`),
+  declared in that package's `root.go`, tagged `//nolint:gochecknoglobals`.
+- Each leaf subcommand lives in its own file in the same package (e.g.
+  `backup/run.go`), with its own package-level `*cobra.Command` var and a
+  `//nolint:gochecknoinits func init()` that declares flags on
+  `cmd.Flags()`/`PersistentFlags()` and calls `ParentCmd.AddCommand(leafCmd)`.
+- Flags are read back inside `RunE` via `cmd.Flags().GetString(...)` etc. —
+  never `viper.BindPFlag`.
+- For a repeatable flag, use pflag's `StringArray`/`GetStringArray`, not
+  `StringSlice` (which comma-splits each occurrence and corrupts values that
+  legitimately contain a comma).
+- Viper is reserved for:
+  - unmarshalling a YAML config file plus env vars into a config struct via
+    `viper.Unmarshal(&configuration)` (see `core/pkg/config`), for commands
+    with persistent application configuration;
+  - `viper.BindEnv("dotted.key", "ENV_VAR")` for individual env-var fallbacks
+    that aren't part of that config struct (see `core/cmd/root.go`'s
+    `AWS_REGION`/`CUSTOM_CNPG_GROUP` binds).
+
+  Don't introduce a YAML config file or `viper.Unmarshal`-into-struct for a
+  command with no persistent app configuration.
+- Error wrapping: `fmt.Errorf("while <doing x>: %w", err)`.
+- Always use `cmd.Context()` inside command code, never `context.Background()`.
+- The top-level `Execute(ctx)` exits 1 on any error (including cobra's own
+  flag-parsing errors) — there is no exit-code-2-for-usage-errors convention.
+- `core/kopia-pgbasebackup` is a separate, detached helper binary (own Go
+  module, invoked via `os/exec`, no YAML app config) but follows these same
+  flag/env-var conventions; see `core/kopia-pgbasebackup/cmd/root.go`.
+
 ### `kopia-pgbasebackup` ingestion helper
 
 `core/kopia-pgbasebackup` is a separate, nested Go module (its own `go.mod` and
@@ -260,7 +295,8 @@ what the operation does:
 binary. It imports Kopia under the canonical path `github.com/kopia/kopia` with a
 `replace` directive pointing at the `leonardoce/kopia` fork; drop the `replace`
 once the patches merge upstream. The design is in
-`documentation/design/basebackup-kopia-ingestion.md`.
+`documentation/design/basebackup-kopia-ingestion.md`. It follows the cobra/viper
+CLI conventions above (see `core/kopia-pgbasebackup/cmd/root.go`).
 
 Because Go does not descend into nested modules, `task core:lint` and
 `task core:go-test` do not cover it. CI does cover it through the dedicated
