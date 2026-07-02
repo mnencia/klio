@@ -53,11 +53,18 @@ var (
 	// installed but the BASE_BACKUP protocol path was requested.
 	ErrHelperNotAvailable = errors.New("the kopia-pgbasebackup helper is not available")
 
-	// ErrIncrementalRequiresProtocol is returned when an incremental backup (or an
-	// explicit previous backup) is requested without the BASE_BACKUP protocol
-	// path, which is the only path able to produce an incremental backup.
+	// ErrIncrementalRequiresProtocol is returned when an incremental backup is
+	// requested without the BASE_BACKUP protocol path, which is the only path
+	// able to produce an incremental backup.
 	ErrIncrementalRequiresProtocol = errors.New(
 		"incremental backup requires the BASE_BACKUP protocol path (--use-base-backup-protocol)")
+
+	// ErrPreviousBackupNameRequiresIncremental is returned when
+	// --previous-backup-name is set without --incremental: naming a specific
+	// backup as the incremental base has no effect unless an incremental backup
+	// is actually requested.
+	ErrPreviousBackupNameRequiresIncremental = errors.New(
+		"--previous-backup-name requires --incremental")
 )
 
 // runCmd represents the `backup run` command
@@ -113,10 +120,17 @@ func runBackup(cmd *cobra.Command, _ []string) error {
 	incremental = resolveBackupOption(
 		cmd.Flags().Changed("incremental"), incremental, configuration.Backup.Incremental)
 
-	// Incremental backups (and an explicitly named prior backup) only exist on
-	// the BASE_BACKUP protocol path. Reject the combination loudly instead of
-	// silently taking a full filesystem-snapshot backup.
-	if err := validateIncrementalRequiresProtocol(incremental, previousBackupName, useProtocol); err != nil {
+	// Naming a previous backup only makes sense when requesting an incremental
+	// backup. Reject the combination loudly instead of silently dropping the
+	// name and taking a full backup.
+	if err := validatePreviousBackupNameRequiresIncremental(incremental, previousBackupName); err != nil {
+		return err
+	}
+
+	// Incremental backups only exist on the BASE_BACKUP protocol path. Reject
+	// the combination loudly instead of silently taking a full
+	// filesystem-snapshot backup.
+	if err := validateIncrementalRequiresProtocol(incremental, useProtocol); err != nil {
 		return err
 	}
 
@@ -303,12 +317,24 @@ func resolveBackupOption(flagChanged, flagValue, configValue bool) bool {
 }
 
 // validateIncrementalRequiresProtocol rejects requesting an incremental backup
-// (or an explicit previous backup) without the BASE_BACKUP protocol path, which
-// is the only path able to produce one. Without this guard the request would be
-// silently downgraded to a full filesystem-snapshot backup.
-func validateIncrementalRequiresProtocol(incremental bool, previousBackupName string, useProtocol bool) error {
-	if (incremental || previousBackupName != "") && !useProtocol {
+// without the BASE_BACKUP protocol path, which is the only path able to
+// produce one. Without this guard the request would be silently downgraded to
+// a full filesystem-snapshot backup.
+func validateIncrementalRequiresProtocol(incremental, useProtocol bool) error {
+	if incremental && !useProtocol {
 		return ErrIncrementalRequiresProtocol
+	}
+
+	return nil
+}
+
+// validatePreviousBackupNameRequiresIncremental rejects specifying a previous
+// backup name without also requesting an incremental backup. Without this
+// guard the name would be silently dropped and a full backup would run
+// instead of using (or hard-erroring on) the named one.
+func validatePreviousBackupNameRequiresIncremental(incremental bool, previousBackupName string) error {
+	if previousBackupName != "" && !incremental {
+		return ErrPreviousBackupNameRequiresIncremental
 	}
 
 	return nil
@@ -676,11 +702,12 @@ func init() {
 	runCmd.Flags().String(
 		"previous-backup-name",
 		"",
-		"Optional name of the backup to use as the incremental base. Its "+
-			"backup_manifest and its Kopia snapshots are both used, so they always "+
-			"match. When unset, klio uses the most recent backup. A named backup "+
-			"that does not exist or cannot serve as a base is a hard error (unlike "+
-			"the auto-detected case, which falls back to a full backup).")
+		"Optional name of the backup to use as the incremental base. Requires "+
+			"--incremental. Its backup_manifest and its Kopia snapshots are both "+
+			"used, so they always match. When unset, klio uses the most recent "+
+			"backup. A named backup that does not exist or cannot serve as a base "+
+			"is a hard error (unlike the auto-detected case, which falls back to a "+
+			"full backup).")
 
 	// Cobra supports Persistent Flags which will work for this command
 	// and all subcommands, e.g.:

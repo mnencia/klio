@@ -17,7 +17,7 @@ klio backup run [flags]
   -h, --help                          help for run
       --incremental                   Request a PostgreSQL incremental backup (BASE_BACKUP INCREMENTAL). Requires --use-base-backup-protocol and PostgreSQL 17+. The prior backup is detected automatically; when none is usable, klio logs a warning and falls back to a full backup.
   -n, --name string                   The backup name
-      --previous-backup-name string   Optional name of the backup to use as the incremental base. Its backup_manifest and its Kopia snapshots are both used, so they always match. When unset, klio uses the most recent backup. A named backup that does not exist or cannot serve as a base is a hard error (unlike the auto-detected case, which falls back to a full backup).
+      --previous-backup-name string   Optional name of the backup to use as the incremental base. Requires --incremental. Its backup_manifest and its Kopia snapshots are both used, so they always match. When unset, klio uses the most recent backup. A named backup that does not exist or cannot serve as a base is a hard error (unlike the auto-detected case, which falls back to a full backup).
       --use-base-backup-protocol      Opt in to sourcing the base backup from the PostgreSQL BASE_BACKUP streaming-replication protocol and ingesting it through the kopia-pgbasebackup helper. Disabled by default: klio snapshots a locally-mounted PGDATA as before. May also be enabled via the Klio configuration (backup.use_base_backup_protocol).
       --wait-for-wals                 When enabled, wait until all the required WAL files have been archived in tier1 before declaring the backup completed. (default true)
 ```

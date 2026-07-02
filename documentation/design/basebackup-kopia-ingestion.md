@@ -66,10 +66,11 @@ The path is chosen for each backup:
   the client configuration (`backup.use_base_backup_protocol`,
   `backup.incremental`).
 
-An explicit CLI flag overrides the value set by the operator. Two requests are
-rejected with a clear error instead of doing something surprising: asking for
-`--incremental` (or `--previous-backup-name`) without the protocol path, and
-asking for an incremental against a server older than PostgreSQL 17.
+An explicit CLI flag overrides the value set by the operator. Three requests
+are rejected with a clear error instead of doing something surprising: asking
+for `--incremental` without the protocol path, asking for
+`--previous-backup-name` without `--incremental`, and asking for an
+incremental against a server older than PostgreSQL 17.
 
 ## Architecture
 

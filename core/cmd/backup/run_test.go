@@ -48,20 +48,30 @@ func TestResolveBackupOption(t *testing.T) {
 
 func TestValidateIncrementalRequiresProtocol(t *testing.T) {
 	t.Run("incremental without protocol is rejected", func(t *testing.T) {
-		err := validateIncrementalRequiresProtocol(true, "", false)
-		require.ErrorIs(t, err, ErrIncrementalRequiresProtocol)
-	})
-
-	t.Run("previous backup name without protocol is rejected", func(t *testing.T) {
-		err := validateIncrementalRequiresProtocol(false, "base-1", false)
+		err := validateIncrementalRequiresProtocol(true, false)
 		require.ErrorIs(t, err, ErrIncrementalRequiresProtocol)
 	})
 
 	t.Run("incremental with protocol is allowed", func(t *testing.T) {
-		require.NoError(t, validateIncrementalRequiresProtocol(true, "base-1", true))
+		require.NoError(t, validateIncrementalRequiresProtocol(true, true))
 	})
 
 	t.Run("neither requested is allowed", func(t *testing.T) {
-		require.NoError(t, validateIncrementalRequiresProtocol(false, "", false))
+		require.NoError(t, validateIncrementalRequiresProtocol(false, false))
+	})
+}
+
+func TestValidatePreviousBackupNameRequiresIncremental(t *testing.T) {
+	t.Run("previous backup name without incremental is rejected", func(t *testing.T) {
+		err := validatePreviousBackupNameRequiresIncremental(false, "base-1")
+		require.ErrorIs(t, err, ErrPreviousBackupNameRequiresIncremental)
+	})
+
+	t.Run("previous backup name with incremental is allowed", func(t *testing.T) {
+		require.NoError(t, validatePreviousBackupNameRequiresIncremental(true, "base-1"))
+	})
+
+	t.Run("no previous backup name without incremental is allowed", func(t *testing.T) {
+		require.NoError(t, validatePreviousBackupNameRequiresIncremental(false, ""))
 	})
 }
