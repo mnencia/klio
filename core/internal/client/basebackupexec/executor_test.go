@@ -226,7 +226,7 @@ func TestBuildMetadata(t *testing.T) {
 		Manifest: []byte("m"),
 	}
 
-	meta := e.buildMetadata("backup-1", started, env, result)
+	meta := e.buildMetadata("backup-1", started, env, result, false)
 
 	assert.Equal(t, "backup-1", meta.Name)
 	assert.Equal(t, "cluster-a", meta.ClusterName)
@@ -246,4 +246,19 @@ func TestBuildMetadata(t *testing.T) {
 	// WAL file names are derived from LSN + TLI + segment size.
 	assert.NotEmpty(t, meta.StartWAL)
 	assert.NotEmpty(t, meta.EndWAL)
+
+	// A full backup records the full method annotation.
+	assert.Equal(t, BackupMethodFull, meta.Annotations[BackupMethodAnnotationName])
+}
+
+func TestBuildMetadataRecordsIncrementalMethod(t *testing.T) {
+	e := &Executor{clusterName: "cluster-a"}
+	env := &environment{pgData: "/pgdata", segmentSize: 16 * 1024 * 1024}
+	result := &basebackup.Result{StartLSN: 0x2000028, StartTLI: 1, EndLSN: 0x3000000}
+
+	full := e.buildMetadata("backup-full", time.Unix(1000, 0), env, result, false)
+	assert.Equal(t, BackupMethodFull, full.Annotations[BackupMethodAnnotationName])
+
+	incremental := e.buildMetadata("backup-incr", time.Unix(1000, 0), env, result, true)
+	assert.Equal(t, BackupMethodIncremental, incremental.Annotations[BackupMethodAnnotationName])
 }

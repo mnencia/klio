@@ -40,6 +40,22 @@ import (
 	"github.com/cloudnative-pg/klio/core/internal/kopia"
 )
 
+// BackupMethodAnnotationName is the metadata annotation recording whether the
+// backup was assembled as an incremental (BASE_BACKUP INCREMENTAL) or as a full
+// backup. It is surfaced on the Backup resource as .status.pluginMetadata, so
+// callers can distinguish an incremental backup from a full one (including one
+// that fell back from an incremental request) without reading logs.
+const BackupMethodAnnotationName = "klio.io/backup-method"
+
+const (
+	// BackupMethodIncremental is the BackupMethodAnnotationName value for an
+	// incremental backup.
+	BackupMethodIncremental = "incremental"
+
+	// BackupMethodFull is the BackupMethodAnnotationName value for a full backup.
+	BackupMethodFull = "full"
+)
+
 // Uploader is the subset of the Kopia connection the executor needs. It is
 // implemented by *kopia.Connection.
 type Uploader interface {
@@ -151,7 +167,7 @@ func (e *Executor) Run(ctx context.Context, opts Options) (*klioclient.BackupMet
 		return nil, fmt.Errorf("while running BASE_BACKUP: %w", err)
 	}
 
-	metadata := e.buildMetadata(name, startedAt, env, result)
+	metadata := e.buildMetadata(name, startedAt, env, result, opts.Incremental)
 	metadata.KopiaManifests = kopiaManifests
 	// BASE_BACKUP ships backup_label, tablespace_map and global/pg_control
 	// inside the data tar, so the restored tree is self-contained.
@@ -265,6 +281,7 @@ func (e *Executor) buildMetadata(
 	startedAt time.Time,
 	env *environment,
 	result *basebackup.Result,
+	incremental bool,
 ) *klioclient.BackupMetadata {
 	tablespaces := make([]klioclient.TablespaceLayout, 0, len(result.Tablespaces))
 	for _, tbl := range result.Tablespaces {
@@ -304,6 +321,15 @@ func (e *Executor) buildMetadata(
 			metadata.EndWAL = endWAL
 		}
 	}
+
+	// Record whether this backup was assembled incrementally, so the Backup
+	// resource reflects it. An incremental request that fell back to a full
+	// backup is recorded as full, since incremental is cleared upstream.
+	method := BackupMethodFull
+	if incremental {
+		method = BackupMethodIncremental
+	}
+	metadata.SetAnnotation(BackupMethodAnnotationName, method)
 
 	return metadata
 }

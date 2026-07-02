@@ -34,11 +34,9 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/types"
 
-	"github.com/cloudnative-pg/klio/operator/internal/cnpgi"
 	"github.com/cloudnative-pg/klio/operator/internal/klioconfig"
 	machineryConditions "github.com/cloudnative-pg/klio/operator/test/machinery/pkg/conditions"
 	machineryFeatures "github.com/cloudnative-pg/klio/operator/test/machinery/pkg/features"
-	"github.com/cloudnative-pg/klio/operator/test/machinery/pkg/pods"
 	"github.com/cloudnative-pg/klio/operator/test/machinery/pkg/postgres"
 	"github.com/cloudnative-pg/klio/operator/test/utils/mutators"
 	"github.com/cloudnative-pg/klio/operator/test/utils/templates/certificates"
@@ -91,10 +89,7 @@ func (f *incrementalRecoveryFeature) Run() types.StepFunc {
 
 		// The first backup requested incremental too, but no prior exists yet, so
 		// it must have fallen back to a full backup rather than failing.
-		fullLogs, err := pods.GetLogs(ctx, r, src, cnpgi.KlioPluginContainerName)
-		require.NoError(t, err, "failed to get klio-plugin logs after full backup")
-		require.Contains(t, fullLogs, "no previous backup exists",
-			"first backup did not fall back to a full backup")
+		assertBackupMethod(ctx, t, r, f.fullBackup, backupMethodFull)
 
 		// Second data set, then an incremental backup against the prior one.
 		_, err = postgres.ExecPostgresQuery(ctx, r, src, "postgres",
@@ -109,10 +104,7 @@ func (f *incrementalRecoveryFeature) Run() types.StepFunc {
 
 		// Confirm the second backup really took the incremental path (and did
 		// not silently fall back to a full backup).
-		logs, err := pods.GetLogs(ctx, r, src, cnpgi.KlioPluginContainerName)
-		require.NoError(t, err, "failed to get klio-plugin logs")
-		require.Contains(t, logs, "Uploading prior manifest for incremental backup",
-			"second backup did not take the incremental path")
+		assertBackupMethod(ctx, t, r, f.incrementalBackup, backupMethodIncremental)
 
 		// Recover from the incremental backup.
 		for _, mutate := range f.mutate {
@@ -135,6 +127,27 @@ func (f *incrementalRecoveryFeature) Run() types.StepFunc {
 
 		return ctx
 	}
+}
+
+// Backup method plugin-metadata key and values. These mirror
+// basebackupexec.BackupMethodAnnotationName and its values in the core module,
+// which the operator cannot import; keep them in sync.
+const (
+	backupMethodAnnotationName = "klio.io/backup-method"
+	backupMethodIncremental    = "incremental"
+	backupMethodFull           = "full"
+)
+
+// assertBackupMethod asserts that the completed backup recorded the expected
+// method (full or incremental) on its .status.pluginMetadata.
+func assertBackupMethod(
+	ctx context.Context, t *testing.T, r *resources.Resources, backup *cnpgv1.Backup, want string,
+) {
+	t.Helper()
+	var got cnpgv1.Backup
+	require.NoError(t, r.Get(ctx, backup.Name, backup.Namespace, &got), "failed to get backup %s", backup.Name)
+	require.Equal(t, want, got.Status.PluginMetadata[backupMethodAnnotationName],
+		"unexpected backup method on %s", backup.Name)
 }
 
 func assertCount(ctx context.Context, t *testing.T, r *resources.Resources, pod *corev1.Pod, table string, want int) {
@@ -303,17 +316,11 @@ func (f *summariesUnavailableFallbackFeature) Run() types.StepFunc {
 			wait.For(machineryConditions.BackupIsCompleted(r, f.secondBackup), backupTimeout, backupInterval),
 			"second backup not completed")
 
-		// Assert on the Backup CR status. With summarize_wal off the server cannot
-		// produce an incremental BASE_BACKUP, so had the pre-check not fallen back
-		// to a full backup, the incremental would have failed and the Backup would
-		// be in the Failed phase. Reaching Completed is therefore the proof that the
-		// incremental request degraded to a full backup.
-		var secondBackup cnpgv1.Backup
-		require.NoError(t,
-			r.Get(ctx, f.secondBackup.Name, f.secondBackup.Namespace, &secondBackup),
-			"failed to get the second backup")
-		require.Equal(t, cnpgv1.BackupPhaseCompleted, string(secondBackup.Status.Phase),
-			"the incremental request should have fallen back to a completed full backup")
+		// With summarize_wal off the server cannot produce an incremental
+		// BASE_BACKUP, so the incremental request must have degraded to a full
+		// backup: the completed Backup records the full method on its plugin
+		// metadata (had it not fallen back, the incremental would have failed).
+		assertBackupMethod(ctx, t, r, f.secondBackup, backupMethodFull)
 
 		return ctx
 	}

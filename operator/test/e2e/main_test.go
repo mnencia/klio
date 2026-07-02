@@ -60,6 +60,10 @@ func TestMain(m *testing.M) {
 		IncrementalFallsBackWithoutSummaries(envconf.RandomName("incremental-fallback-nosummaries", 32)),
 		runner.WithSerialExecution(),
 	)
+	runner.RegisterFeature(
+		RecoverClusterViaIncrementalWithNewTablespace(envconf.RandomName("incremental-new-tablespace", 32)),
+		runner.WithSerialExecution(),
+	)
 	runner.RegisterFeature(RecoverReplicaCluster(envconf.RandomName("recovery-replica-cluster", 32)))
 	runner.RegisterFeature(RecoverClusterWithTablespaces(envconf.RandomName("recovery-tablespace", 32)))
 	runner.RegisterFeature(RecoverClusterFromPitr(envconf.RandomName("recovery-from-pitr", 32)))

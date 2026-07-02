@@ -126,6 +126,14 @@ The E2E tests are located in `operator/test/e2e/` and include:
   `IncrementalFallsBackWithoutSummaries`: the negative path, where a
   cluster with `summarize_wal` off makes an incremental request fall back
   to a full backup instead of failing.
+- **`incremental_tablespace_test.go`** - the per-source incremental
+  decision (`RecoverClusterViaIncrementalWithNewTablespace`, serial): a
+  tablespace is added to the source cluster only after the full backup,
+  so on the incremental backup the main data directory is ingested
+  incrementally while the new tablespace is ingested as a full source.
+  The recovery then verifies both data sets are present. Each backup's
+  method (full or incremental) is asserted on the Backup resource's
+  `.status.pluginMetadata` (`klio.io/backup-method`) rather than on logs.
 - **`tablespace_recovery_test.go`** - Recovery preserving PostgreSQL
   tablespaces (`RecoverClusterWithTablespaces`)
 - **`tier2_recovery_test.go`** - Recovery from tier2 S3 storage
