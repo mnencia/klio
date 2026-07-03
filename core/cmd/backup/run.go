@@ -685,17 +685,15 @@ func init() {
 	runCmd.Flags().Bool(
 		"use-base-backup-protocol",
 		false,
-		"Opt in to sourcing the base backup from the PostgreSQL BASE_BACKUP "+
-			"streaming-replication protocol and ingesting it through the "+
-			"kopia-pgbasebackup helper. Disabled by default: klio snapshots a "+
-			"locally-mounted PGDATA as before. May also be enabled via the Klio "+
-			"configuration (backup.use_base_backup_protocol).")
+		"Take the base backup over the PostgreSQL BASE_BACKUP "+
+			"streaming-replication protocol and ingest it into the Kopia "+
+			"repository through the kopia-pgbasebackup helper.")
 
 	runCmd.Flags().Bool(
 		"incremental",
 		false,
-		"Request a PostgreSQL incremental backup (BASE_BACKUP INCREMENTAL). "+
-			"Requires --use-base-backup-protocol and PostgreSQL 17+. The prior "+
+		"Request a PostgreSQL incremental backup. Requires "+
+			"--use-base-backup-protocol and PostgreSQL 17+. The prior "+
 			"backup is detected automatically; when none is usable, klio logs a "+
 			"warning and falls back to a full backup.")
 
@@ -703,11 +701,7 @@ func init() {
 		"previous-backup-name",
 		"",
 		"Optional name of the backup to use as the incremental base. Requires "+
-			"--incremental. Its backup_manifest and its Kopia snapshots are both "+
-			"used, so they always match. When unset, klio uses the most recent "+
-			"backup. A named backup that does not exist or cannot serve as a base "+
-			"is a hard error (unlike the auto-detected case, which falls back to a "+
-			"full backup).")
+			"--incremental. When unset, klio uses the most recent backup.")
 
 	// Cobra supports Persistent Flags which will work for this command
 	// and all subcommands, e.g.:
