@@ -167,7 +167,10 @@ func (e *Executor) Run(ctx context.Context, opts Options) (*klioclient.BackupMet
 		return nil, fmt.Errorf("while running BASE_BACKUP: %w", err)
 	}
 
-	metadata := e.buildMetadata(name, startedAt, env, result, opts.Incremental)
+	metadata, err := e.buildMetadata(name, startedAt, env, result, opts.Incremental)
+	if err != nil {
+		return nil, err
+	}
 	metadata.KopiaManifests = kopiaManifests
 	// BASE_BACKUP ships backup_label, tablespace_map and global/pg_control
 	// inside the data tar, so the restored tree is self-contained.
@@ -200,7 +203,10 @@ func (e *Executor) makeHandler(
 	}
 
 	return func(ctx context.Context, src basebackup.DataSource, tar io.Reader) error {
-		key, sourcePath, tags := sourceDescriptor(src, name, env)
+		key, sourcePath, tags, err := sourceDescriptor(src, name, env)
+		if err != nil {
+			return err
+		}
 
 		// Incremental is decided per source, not per backup. A source that has no
 		// prior combine base (for example a tablespace created after the previous
@@ -253,21 +259,26 @@ const mainDataSourceKey = "pgdata"
 // for tablespaces.
 func sourceDescriptor(
 	src basebackup.DataSource, name string, env *environment,
-) (string, string, map[string]string) {
+) (string, string, map[string]string, error) {
 	if src.IsTablespace {
+		tsName, err := env.tablespaceName(src.TablespaceOID)
+		if err != nil {
+			return "", "", nil, err
+		}
+
 		key := "/tablespace/" + src.TablespaceOID
 
 		return key, key, map[string]string{
 			klioclient.BackupContentTagName:  "tablespace",
-			klioclient.TablespaceNameTagName: env.tablespaceNames[src.TablespaceOID],
+			klioclient.TablespaceNameTagName: tsName,
 			klioclient.BackupNameTagName:     name,
-		}
+		}, nil
 	}
 
 	return mainDataSourceKey, env.pgData, map[string]string{
 		klioclient.BackupContentTagName: "pgdata",
 		klioclient.BackupNameTagName:    name,
-	}
+	}, nil
 }
 
 // buildMetadata assembles BackupMetadata from the protocol result.
@@ -282,16 +293,20 @@ func (e *Executor) buildMetadata(
 	env *environment,
 	result *basebackup.Result,
 	incremental bool,
-) *klioclient.BackupMetadata {
+) (*klioclient.BackupMetadata, error) {
 	tablespaces := make([]klioclient.TablespaceLayout, 0, len(result.Tablespaces))
 	for _, tbl := range result.Tablespaces {
 		if tbl.OID == "" {
 			// The main data directory entry; not a real tablespace.
 			continue
 		}
+		tsName, err := env.tablespaceName(tbl.OID)
+		if err != nil {
+			return nil, err
+		}
 		tablespaces = append(tablespaces, klioclient.TablespaceLayout{
 			Oid:  tbl.OID,
-			Name: env.tablespaceNames[tbl.OID],
+			Name: tsName,
 			Path: tbl.Location,
 		})
 	}
@@ -331,5 +346,5 @@ func (e *Executor) buildMetadata(
 	}
 	metadata.SetAnnotation(BackupMethodAnnotationName, method)
 
-	return metadata
+	return metadata, nil
 }

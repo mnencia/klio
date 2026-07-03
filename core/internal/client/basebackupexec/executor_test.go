@@ -178,7 +178,8 @@ func TestSourceDescriptor(t *testing.T) {
 	}
 
 	t.Run("main data directory", func(t *testing.T) {
-		key, path, tags := sourceDescriptor(basebackup.DataSource{}, "backup-1", env)
+		key, path, tags, err := sourceDescriptor(basebackup.DataSource{}, "backup-1", env)
+		require.NoError(t, err)
 		assert.Equal(t, mainDataSourceKey, key)
 		assert.Equal(t, "/var/lib/postgresql/data/pgdata", path)
 		assert.Equal(t, "pgdata", tags[klioclient.BackupContentTagName])
@@ -187,8 +188,10 @@ func TestSourceDescriptor(t *testing.T) {
 
 	t.Run("main data directory key is stable across data_directory changes", func(t *testing.T) {
 		moved := &environment{pgData: "/srv/restored/pgdata"}
-		keyA, _, _ := sourceDescriptor(basebackup.DataSource{}, "backup-1", env)
-		keyB, pathB, _ := sourceDescriptor(basebackup.DataSource{}, "backup-2", moved)
+		keyA, _, _, errA := sourceDescriptor(basebackup.DataSource{}, "backup-1", env)
+		keyB, pathB, _, errB := sourceDescriptor(basebackup.DataSource{}, "backup-2", moved)
+		require.NoError(t, errA)
+		require.NoError(t, errB)
 		// The combine-base key must not move with the physical path, while the
 		// snapshot path tracks the physical data_directory.
 		assert.Equal(t, keyA, keyB)
@@ -197,11 +200,18 @@ func TestSourceDescriptor(t *testing.T) {
 
 	t.Run("tablespace", func(t *testing.T) {
 		src := basebackup.DataSource{IsTablespace: true, TablespaceOID: "16385", Location: "/srv/ts"}
-		key, path, tags := sourceDescriptor(src, "backup-1", env)
+		key, path, tags, err := sourceDescriptor(src, "backup-1", env)
+		require.NoError(t, err)
 		assert.Equal(t, "/tablespace/16385", key)
 		assert.Equal(t, "/tablespace/16385", path)
 		assert.Equal(t, "tablespace", tags[klioclient.BackupContentTagName])
 		assert.Equal(t, "ts_fast", tags[klioclient.TablespaceNameTagName])
+	})
+
+	t.Run("tablespace with an OID unknown to the environment errors", func(t *testing.T) {
+		src := basebackup.DataSource{IsTablespace: true, TablespaceOID: "99999", Location: "/srv/ghost"}
+		_, _, _, err := sourceDescriptor(src, "backup-1", env)
+		require.ErrorIs(t, err, ErrUnknownTablespace)
 	})
 }
 
@@ -226,7 +236,8 @@ func TestBuildMetadata(t *testing.T) {
 		Manifest: []byte("m"),
 	}
 
-	meta := e.buildMetadata("backup-1", started, env, result, false)
+	meta, err := e.buildMetadata("backup-1", started, env, result, false)
+	require.NoError(t, err)
 
 	assert.Equal(t, "backup-1", meta.Name)
 	assert.Equal(t, "cluster-a", meta.ClusterName)
@@ -251,14 +262,38 @@ func TestBuildMetadata(t *testing.T) {
 	assert.Equal(t, BackupMethodFull, meta.Annotations[BackupMethodAnnotationName])
 }
 
+// TestBuildMetadataUnknownTablespaceIsError is the regression test for a
+// tablespace created or renamed between readEnvironment's pg_tablespace query
+// and the BASE_BACKUP protocol's own, later tablespace list: an OID present
+// in result.Tablespaces but absent from env.tablespaceNames must fail loudly
+// instead of recording an empty tablespace name.
+func TestBuildMetadataUnknownTablespaceIsError(t *testing.T) {
+	e := &Executor{clusterName: "cluster-a"}
+	env := &environment{pgData: "/pgdata", tablespaceNames: map[string]string{}}
+	result := &basebackup.Result{
+		StartLSN: 0x2000028,
+		StartTLI: 1,
+		EndLSN:   0x3000000,
+		Tablespaces: []basebackup.Tablespace{
+			{OID: "", Location: ""},
+			{OID: "99999", Location: "/srv/ghost"},
+		},
+	}
+
+	_, err := e.buildMetadata("backup-1", time.Unix(1000, 0), env, result, false)
+	require.ErrorIs(t, err, ErrUnknownTablespace)
+}
+
 func TestBuildMetadataRecordsIncrementalMethod(t *testing.T) {
 	e := &Executor{clusterName: "cluster-a"}
 	env := &environment{pgData: "/pgdata", segmentSize: 16 * 1024 * 1024}
 	result := &basebackup.Result{StartLSN: 0x2000028, StartTLI: 1, EndLSN: 0x3000000}
 
-	full := e.buildMetadata("backup-full", time.Unix(1000, 0), env, result, false)
+	full, err := e.buildMetadata("backup-full", time.Unix(1000, 0), env, result, false)
+	require.NoError(t, err)
 	assert.Equal(t, BackupMethodFull, full.Annotations[BackupMethodAnnotationName])
 
-	incremental := e.buildMetadata("backup-incr", time.Unix(1000, 0), env, result, true)
+	incremental, err := e.buildMetadata("backup-incr", time.Unix(1000, 0), env, result, true)
+	require.NoError(t, err)
 	assert.Equal(t, BackupMethodIncremental, incremental.Annotations[BackupMethodAnnotationName])
 }
