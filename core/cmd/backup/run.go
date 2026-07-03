@@ -536,7 +536,7 @@ func resolvePreviousBackup(
 	}
 
 	executorOpts.PreviousManifest = manifest
-	executorOpts.PreviousKopiaManifests = basebackupexec.ToMultiManifestMap(prior.KopiaManifests)
+	executorOpts.PreviousKopiaManifests = prior.KopiaManifests
 
 	return true, nil
 }

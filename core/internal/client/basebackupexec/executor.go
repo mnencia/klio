@@ -135,10 +135,10 @@ type Options struct {
 	PreviousManifest []byte
 
 	// PreviousKopiaManifests maps a source path to the prior snapshot's Kopia
-	// manifest IDs, passed to the helper so it can combine the incremental
+	// manifest ID, passed to the helper so it can combine the incremental
 	// against the prior full image. Resolving these from the repository is the
 	// caller's responsibility.
-	PreviousKopiaManifests map[string][]string
+	PreviousKopiaManifests map[string]string
 }
 
 // Run executes the backup and returns its assembled metadata.
@@ -229,15 +229,15 @@ func (e *Executor) makeHandler(
 		// backup) is ingested as a full source even during an incremental backup:
 		// PostgreSQL streams its files in full, and passing --incremental with no
 		// --previous-manifest would fail the helper.
-		previousManifests := opts.PreviousKopiaManifests[key]
-		srcIncremental := opts.Incremental && len(previousManifests) > 0
+		previousManifest := opts.PreviousKopiaManifests[key]
+		srcIncremental := opts.Incremental && previousManifest != ""
 
 		ingestOpts := kopia.IngestOptions{
-			SourcePath:        sourcePath,
-			Tags:              tags,
-			Pins:              pins,
-			Incremental:       srcIncremental,
-			PreviousManifests: previousManifests,
+			SourcePath:       sourcePath,
+			Tags:             tags,
+			Pins:             pins,
+			Incremental:      srcIncremental,
+			PreviousManifest: previousManifest,
 		}
 
 		res, err := e.uploader.IngestBaseBackup(ctx, tar, ingestOpts)

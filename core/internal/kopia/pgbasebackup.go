@@ -94,9 +94,9 @@ type IngestOptions struct {
 	// e.g. the tier2 pin).
 	Pins []string
 
-	// PreviousManifests holds the prior snapshot manifest IDs used to combine an
+	// PreviousManifest holds the prior snapshot manifest ID used to combine an
 	// incremental backup into a full image.
-	PreviousManifests []string
+	PreviousManifest string
 
 	// Incremental marks the input tar as an incremental backup.
 	Incremental bool
@@ -146,8 +146,8 @@ func (c *PgBaseBackupClient) Ingest(
 		args = append(args, "--pin="+pin)
 	}
 
-	for _, manifest := range opts.PreviousManifests {
-		args = append(args, "--previous-manifest="+manifest)
+	if opts.PreviousManifest != "" {
+		args = append(args, "--previous-manifest="+opts.PreviousManifest)
 	}
 
 	if opts.Incremental {
@@ -169,7 +169,7 @@ func (c *PgBaseBackupClient) Ingest(
 		"incremental", opts.Incremental,
 		"tagCount", len(opts.Tags),
 		"pinCount", len(opts.Pins),
-		"previousManifestCount", len(opts.PreviousManifests))
+		"hasPreviousManifest", opts.PreviousManifest != "")
 
 	if err := RunWithLogCapture(ctx, cmd, &stdout); err != nil {
 		return nil, fmt.Errorf("while ingesting BASE_BACKUP source %q: %w", opts.SourcePath, err)

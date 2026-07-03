@@ -72,21 +72,6 @@ func ValidatePriorForIncremental(prior *klioclient.BackupMetadata, systemID int6
 	return true, ""
 }
 
-// ToMultiManifestMap adapts the stored source→manifest-ID map to the
-// source→[]manifest-ID shape the helper expects.
-func ToMultiManifestMap(in map[string]string) map[string][]string {
-	if len(in) == 0 {
-		return nil
-	}
-
-	out := make(map[string][]string, len(in))
-	for source, id := range in {
-		out[source] = []string{id}
-	}
-
-	return out
-}
-
 // findBackupByName returns the backup with the given name, or nil when none
 // matches.
 func findBackupByName(backups klioclient.BackupList, name string) *klioclient.BackupMetadata {

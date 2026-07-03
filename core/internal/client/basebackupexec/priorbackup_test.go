@@ -126,20 +126,3 @@ func TestFindBackupByName(t *testing.T) {
 		assert.Nil(t, findBackupByName(nil, "first"))
 	})
 }
-
-func TestToMultiManifestMap(t *testing.T) {
-	t.Run("nil for empty input", func(t *testing.T) {
-		assert.Nil(t, ToMultiManifestMap(nil))
-	})
-
-	t.Run("wraps each id in a single-element slice", func(t *testing.T) {
-		// Keys mirror the real combine-base keys: the constant "pgdata" for the
-		// main data directory (no leading slash) and /tablespace/<oid>.
-		out := ToMultiManifestMap(map[string]string{
-			"pgdata":          "m-pgdata",
-			"/tablespace/123": "m-ts",
-		})
-		assert.Equal(t, []string{"m-pgdata"}, out["pgdata"])
-		assert.Equal(t, []string{"m-ts"}, out["/tablespace/123"])
-	})
-}

@@ -39,7 +39,7 @@ import (
 
 var (
 	errInvalidTag                  = errors.New("invalid --tag, expected key=value")
-	errIncrementalRequiresPrevious = errors.New("--incremental requires at least one --previous-manifest")
+	errIncrementalRequiresPrevious = errors.New("--incremental requires --previous-manifest")
 )
 
 // ingestCmd implements the "ingest" subcommand.
@@ -63,8 +63,8 @@ func init() {
 	ingestCmd.Flags().Int("block-size", ingest.DefaultBlockSize, "PostgreSQL BLCKSZ for incremental reconstruction")
 	ingestCmd.Flags().StringArray("tag", nil, "snapshot tag key=value (repeatable)")
 	ingestCmd.Flags().StringArray("pin", nil, "snapshot retention pin (repeatable)")
-	ingestCmd.Flags().StringArray("previous-manifest", nil,
-		"prior snapshot manifest ID for incremental combine (repeatable; only the first is used)")
+	ingestCmd.Flags().String("previous-manifest", "",
+		"prior snapshot manifest ID for incremental combine")
 
 	for _, name := range []string{"config-file", "host", "username", "source-path"} {
 		_ = ingestCmd.MarkFlagRequired(name)
@@ -96,7 +96,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	blockSize, _ := cmd.Flags().GetInt("block-size")
 	tags, _ := cmd.Flags().GetStringArray("tag")
 	pins, _ := cmd.Flags().GetStringArray("pin")
-	prevManis, _ := cmd.Flags().GetStringArray("previous-manifest")
+	prevManifest, _ := cmd.Flags().GetString("previous-manifest")
 
 	tagMap, err := parseTags(tags)
 	if err != nil {
@@ -118,7 +118,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	}
 	defer rep.Close(ctx) //nolint:errcheck
 
-	result, uploaded, err := ingestIntoRepo(ctx, rep, opts, incremental, prevManis)
+	result, uploaded, err := ingestIntoRepo(ctx, rep, opts, incremental, prevManifest)
 	if err != nil {
 		return err
 	}
@@ -133,7 +133,7 @@ func ingestIntoRepo(
 	rep repo.Repository,
 	opts ingest.Options,
 	incremental bool,
-	prevManis []string,
+	prevManifest string,
 ) (*ingest.Result, int64, error) {
 	var (
 		uploaded atomic.Int64
@@ -145,7 +145,7 @@ func ingestIntoRepo(
 		OnUpload: func(n int64) { uploaded.Add(n) },
 	}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		if incremental {
-			prior, priorErr := buildPriorImage(ctx, w, prevManis)
+			prior, priorErr := buildPriorImage(ctx, w, prevManifest)
 			if priorErr != nil {
 				return priorErr
 			}
@@ -164,25 +164,23 @@ func ingestIntoRepo(
 	return result, uploaded.Load(), nil
 }
 
-// buildPriorImage loads the prior snapshot referenced by the first
-// previous-manifest and exposes its tree for incremental reconstruction.
-//
-// The flag is repeatable for forward compatibility, but a single source is
-// combined against exactly one prior snapshot (the depth-1 invariant), so only
-// the first manifest is used; any others are ignored.
+// buildPriorImage loads the prior snapshot referenced by previous-manifest
+// and exposes its tree for incremental reconstruction. A single source is
+// always combined against exactly one prior snapshot (the depth-1
+// invariant), so the flag carries a single manifest ID.
 //
 //nolint:ireturn // returns the PriorImage abstraction by design
-func buildPriorImage(ctx context.Context, rep repo.Repository, prevManis []string) (ingest.PriorImage, error) {
-	if len(prevManis) == 0 {
+func buildPriorImage(ctx context.Context, rep repo.Repository, prevManifest string) (ingest.PriorImage, error) {
+	if prevManifest == "" {
 		return nil, errIncrementalRequiresPrevious
 	}
 
-	prior, err := snapshot.LoadSnapshot(ctx, rep, manifest.ID(prevManis[0]))
+	prior, err := snapshot.LoadSnapshot(ctx, rep, manifest.ID(prevManifest))
 	if err != nil {
-		return nil, fmt.Errorf("while loading prior snapshot %q: %w", prevManis[0], err)
+		return nil, fmt.Errorf("while loading prior snapshot %q: %w", prevManifest, err)
 	}
 	if prior.RootEntry == nil {
-		return nil, fmt.Errorf("prior snapshot %q has no root entry", prevManis[0])
+		return nil, fmt.Errorf("prior snapshot %q has no root entry", prevManifest)
 	}
 
 	return ingest.NewKopiaPriorImage(ctx, rep, prior.RootEntry.ObjectID), nil

@@ -90,7 +90,7 @@ func TestMakeHandlerFallsBackToFullForSourceWithoutPrior(t *testing.T) {
 	opts := Options{
 		Incremental: true,
 		// The main data directory has a prior; the new tablespace does not.
-		PreviousKopiaManifests: map[string][]string{mainDataSourceKey: {"m-pgdata"}},
+		PreviousKopiaManifests: map[string]string{mainDataSourceKey: "m-pgdata"},
 	}
 
 	handler := e.makeHandler("backup-2", env, opts, map[string]string{})
@@ -99,14 +99,14 @@ func TestMakeHandlerFallsBackToFullForSourceWithoutPrior(t *testing.T) {
 	require.NoError(t, handler(context.Background(), basebackup.DataSource{}, strings.NewReader("")))
 	main := up.ingestByPath["/pgdata"]
 	assert.True(t, main.Incremental, "main data dir must be incremental")
-	assert.Equal(t, []string{"m-pgdata"}, main.PreviousManifests)
+	assert.Equal(t, "m-pgdata", main.PreviousManifest)
 
 	// A tablespace with no prior manifest: full ingest, no previous manifests.
 	newTS := basebackup.DataSource{IsTablespace: true, TablespaceOID: "9999"}
 	require.NoError(t, handler(context.Background(), newTS, strings.NewReader("")))
 	ts := up.ingestByPath["/tablespace/9999"]
 	assert.False(t, ts.Incremental, "a source without a prior must be ingested as full")
-	assert.Empty(t, ts.PreviousManifests)
+	assert.Empty(t, ts.PreviousManifest)
 }
 
 // TestMakeHandlerPerSourceIncrementalDecision exercises a single incremental
@@ -123,9 +123,9 @@ func TestMakeHandlerPerSourceIncrementalDecision(t *testing.T) {
 	}
 	opts := Options{
 		Incremental: true,
-		PreviousKopiaManifests: map[string][]string{
-			mainDataSourceKey:   {"m-pgdata"},
-			"/tablespace/16385": {"m-ts-old"},
+		PreviousKopiaManifests: map[string]string{
+			mainDataSourceKey:   "m-pgdata",
+			"/tablespace/16385": "m-ts-old",
 			// "/tablespace/9999" intentionally absent: created after the prior backup.
 		},
 	}
@@ -144,16 +144,16 @@ func TestMakeHandlerPerSourceIncrementalDecision(t *testing.T) {
 	cases := []struct {
 		path            string
 		wantIncremental bool
-		wantManifests   []string
+		wantManifest    string
 	}{
-		{"/pgdata", true, []string{"m-pgdata"}},
-		{"/tablespace/16385", true, []string{"m-ts-old"}},
-		{"/tablespace/9999", false, nil},
+		{"/pgdata", true, "m-pgdata"},
+		{"/tablespace/16385", true, "m-ts-old"},
+		{"/tablespace/9999", false, ""},
 	}
 	for _, tc := range cases {
 		got := up.ingestByPath[tc.path]
 		assert.Equal(t, tc.wantIncremental, got.Incremental, "Incremental for %s", tc.path)
-		assert.Equal(t, tc.wantManifests, got.PreviousManifests, "PreviousManifests for %s", tc.path)
+		assert.Equal(t, tc.wantManifest, got.PreviousManifest, "PreviousManifest for %s", tc.path)
 	}
 }
 
