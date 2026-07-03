@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"os"
 	"os/exec"
 	"slices"
 
@@ -49,12 +48,7 @@ const PgBaseBackupBinary = "kopia-pgbasebackup"
 // LookupPgBaseBackupBinary finds the kopia-pgbasebackup helper in the system
 // PATH and returns its absolute path. It mirrors LookupBinary for the kopia CLI.
 func LookupPgBaseBackupBinary() (string, error) {
-	binary, err := exec.LookPath(PgBaseBackupBinary)
-	if err != nil {
-		return "", fmt.Errorf("kopia-pgbasebackup binary not found (%q): %w", PgBaseBackupBinary, err)
-	}
-
-	return binary, nil
+	return lookupBinary(PgBaseBackupBinary)
 }
 
 // PgBaseBackupClient wraps the kopia-pgbasebackup helper CLI.
@@ -184,13 +178,7 @@ func (c *PgBaseBackupClient) Ingest(
 }
 
 func (c *PgBaseBackupClient) environmentVariables() []string {
-	result := os.Environ()
-	result = append(result, "KOPIA_CHECK_FOR_UPDATES=false")
-	if c.Password != "" {
-		result = append(result, "KOPIA_PASSWORD="+c.Password)
-	}
-
-	return result
+	return kopiaEnvironment(c.Password)
 }
 
 // parseIngestResult decodes the single JSON object printed by the helper.
