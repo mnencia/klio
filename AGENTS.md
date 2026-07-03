@@ -341,6 +341,20 @@ cached index, run tests, then revert.
   `Assisted-by: <tool name>` trailer (e.g. `Assisted-by: Claude`), separated
   from `Signed-off-by` by a blank line. `git commit -s` alone does not add
   this (write both trailers out explicitly).
+- Commit messages are checked by `task all:commitlint` (`commitlint.config.js`,
+  extends `@commitlint/config-conventional`); a failure blocks CI. Beyond
+  standard Conventional Commits, the rules that actually fail the build (as
+  opposed to warn) are:
+  - The body must start with a capital letter (`body-case: sentence-case`).
+    A body that opens with a lowercase code identifier (e.g.
+    `readEnvironment bulk-fetches...`) fails this rule — lead with a
+    capitalized word instead, e.g. `The readEnvironment function
+    bulk-fetches...`.
+  - The `Signed-off-by:` trailer is required (see above).
+  - Wrap body lines at 100 characters or fewer (warning only, but keep to it
+    anyway).
+  - Run `task all:commitlint` locally before pushing to catch this before CI
+    does.
 - Before committing, run:
   - `golangci-lint run` in `core/`
   - `golangci-lint run` in `operator/`
