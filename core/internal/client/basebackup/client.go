@@ -304,8 +304,8 @@ type runState struct {
 
 const (
 	startEndColumnCount    = 2
-	tablespaceColumnCount  = 3
 	startPositionColumnTag = "recptr"
+	tablespaceOIDColumnTag = "spcoid"
 )
 
 func (s *runState) handleResultSet(rs resultSet) error {
@@ -321,15 +321,11 @@ func (s *runState) handleResultSet(rs resultSet) error {
 }
 
 func isStartEndResultSet(rs resultSet) bool {
-	if len(rs.columns) != startEndColumnCount {
-		return false
-	}
-
-	return strings.EqualFold(rs.columns[0], startPositionColumnTag)
+	return len(rs.columns) > 0 && strings.EqualFold(rs.columns[0], startPositionColumnTag)
 }
 
 func isTablespaceResultSet(rs resultSet) bool {
-	return len(rs.columns) == tablespaceColumnCount
+	return len(rs.columns) > 0 && strings.EqualFold(rs.columns[0], tablespaceOIDColumnTag)
 }
 
 func (s *runState) handleStartEndResultSet(rs resultSet) error {
