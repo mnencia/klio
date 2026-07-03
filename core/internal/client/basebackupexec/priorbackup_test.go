@@ -20,13 +20,55 @@ SPDX-License-Identifier: Apache-2.0
 package basebackupexec
 
 import (
+	"context"
+	"errors"
+	"io"
 	"testing"
 
+	"github.com/cloudnative-pg/machinery/pkg/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cloudnative-pg/klio/core/internal/client/klioclient"
+	kopiaconn "github.com/cloudnative-pg/klio/core/internal/client/klioclient/kopia"
+	kopiaWrapper "github.com/cloudnative-pg/klio/core/internal/kopia"
 )
+
+var _ BackupLister = (*kopiaconn.MultiConnection)(nil)
+
+// fakeProtocolUploader implements ProtocolUploader. Only GetBackupManifest is
+// configurable; the rest are trivial stubs since loadPriorManifest never
+// calls them.
+type fakeProtocolUploader struct {
+	manifest    []byte
+	manifestErr error
+}
+
+func (f *fakeProtocolUploader) GetHostname() string { return "cluster-a" }
+
+func (f *fakeProtocolUploader) IngestBaseBackup(
+	context.Context, io.Reader, kopiaWrapper.IngestOptions,
+) (*kopiaWrapper.IngestResult, error) {
+	return nil, nil
+}
+
+func (f *fakeProtocolUploader) UploadBackupManifest(context.Context, string, string, []byte, bool) error {
+	return nil
+}
+
+func (f *fakeProtocolUploader) UploadBackupMetadata(
+	context.Context, string, *klioclient.BackupMetadata, bool,
+) error {
+	return nil
+}
+
+func (f *fakeProtocolUploader) SupportsBaseBackupIngestion() bool { return true }
+
+func (f *fakeProtocolUploader) GetBackupManifest(context.Context, string, string) ([]byte, error) {
+	return f.manifest, f.manifestErr
+}
+
+var _ ProtocolUploader = (*fakeProtocolUploader)(nil)
 
 func TestSelectPriorBackup(t *testing.T) {
 	backups := klioclient.BackupList{
@@ -107,5 +149,55 @@ func TestFindBackupByName(t *testing.T) {
 
 	t.Run("nil for an empty list", func(t *testing.T) {
 		assert.Nil(t, findBackupByName(nil, "first"))
+	})
+}
+
+func TestLoadPriorManifest(t *testing.T) {
+	prior := &klioclient.BackupMetadata{Name: "backup-1"}
+
+	t.Run("manifest found", func(t *testing.T) {
+		tier1 := &fakeProtocolUploader{manifest: []byte("manifest-bytes")}
+
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		require.NoError(t, err)
+		assert.Empty(t, reason)
+		assert.Equal(t, []byte("manifest-bytes"), manifest)
+	})
+
+	t.Run("no stored manifest is a reason, not an error", func(t *testing.T) {
+		tier1 := &fakeProtocolUploader{manifestErr: kopiaconn.NoBackupFoundError{}}
+
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		require.NoError(t, err)
+		assert.Nil(t, manifest)
+		assert.Equal(t, "no stored backup_manifest", reason)
+	})
+
+	t.Run("a repository failure is returned as an error", func(t *testing.T) {
+		tier1 := &fakeProtocolUploader{manifestErr: errors.New("connection reset")}
+
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		require.Error(t, err)
+		assert.Empty(t, reason)
+		assert.Nil(t, manifest)
+	})
+}
+
+func TestPriorUnusable(t *testing.T) {
+	prior := &klioclient.BackupMetadata{Name: "backup-1"}
+	logger := log.FromContext(context.Background())
+
+	t.Run("an explicitly named backup is a hard error", func(t *testing.T) {
+		possible, err := priorUnusable(true, prior, "wrong cluster lineage", logger)
+		assert.False(t, possible)
+		require.ErrorIs(t, err, ErrPreviousBackupUnusable)
+		require.ErrorContains(t, err, "backup-1")
+		require.ErrorContains(t, err, "wrong cluster lineage")
+	})
+
+	t.Run("an auto-detected backup falls back to a full backup with a warning", func(t *testing.T) {
+		possible, err := priorUnusable(false, prior, "wrong cluster lineage", logger)
+		assert.False(t, possible)
+		require.NoError(t, err)
 	})
 }

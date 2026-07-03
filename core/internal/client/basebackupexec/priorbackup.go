@@ -20,10 +20,16 @@ SPDX-License-Identifier: Apache-2.0
 package basebackupexec
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
+	"github.com/cloudnative-pg/machinery/pkg/log"
+	"github.com/cloudnative-pg/machinery/pkg/types"
+	"github.com/jackc/pgx/v5"
+
 	"github.com/cloudnative-pg/klio/core/internal/client/klioclient"
+	kopiaconn "github.com/cloudnative-pg/klio/core/internal/client/klioclient/kopia"
 )
 
 var (
@@ -82,4 +88,207 @@ func findBackupByName(backups klioclient.BackupList, name string) *klioclient.Ba
 	}
 
 	return nil
+}
+
+// BackupLister is the subset of the Kopia connection needed to list a
+// cluster's backups, used to auto-detect or validate the incremental base.
+// It is implemented by *kopia.MultiConnection.
+type BackupLister interface {
+	ListBackups(ctx context.Context, hostname string) (klioclient.BackupList, error)
+}
+
+// ResolvePriorForIncremental tries to set up an incremental backup. It
+// selects a single prior backup and reads both the PostgreSQL backup_manifest
+// (for UPLOAD_MANIFEST) and that backup's per-source Kopia manifest IDs (the
+// combine base) from it, so the two halves always describe the same backup,
+// setting them on executorOpts. It returns true when incremental is possible.
+//
+// The prior is chosen by previousBackupName when set, otherwise as the most
+// recent backup for the cluster. The distinction also governs what happens
+// when the chosen backup turns out to be unusable: an explicitly named
+// backup is a hard error (the user's request cannot be honored), while the
+// auto-detected one falls back to a full backup with a warning.
+func ResolvePriorForIncremental(
+	ctx context.Context,
+	lister BackupLister,
+	tier1 ProtocolUploader,
+	sqlConn *pgx.Conn,
+	hostname string,
+	previousBackupName string,
+	executorOpts *Options,
+) (bool, error) {
+	contextLogger := log.FromContext(ctx)
+
+	backups, err := lister.ListBackups(ctx, hostname)
+	if err != nil {
+		return false, fmt.Errorf("while listing backups: %w", err)
+	}
+
+	explicit := previousBackupName != ""
+	prior, err := SelectPriorBackup(backups, previousBackupName)
+	if err != nil {
+		return false, err
+	}
+	if prior == nil {
+		contextLogger.Warning(
+			"Incremental backup requested but no previous backup exists; falling back to a full backup")
+
+		return false, nil
+	}
+
+	// unusable turns a reason into the right outcome: a hard error when the
+	// backup was named explicitly, or a warning plus a full-backup fallback when
+	// it was auto-detected.
+	unusable := func(reason string) (bool, error) {
+		return priorUnusable(explicit, prior, reason, contextLogger)
+	}
+
+	// The combine base requires the prior backup's per-source Kopia snapshots,
+	// which only the BASE_BACKUP protocol path records. A prior produced by the
+	// filesystem-snapshot path cannot be used as an incremental base.
+	if len(prior.KopiaManifests) == 0 {
+		return unusable("no Kopia manifest references (not produced by the BASE_BACKUP protocol path)")
+	}
+
+	if reason := checkPriorLineage(ctx, sqlConn, prior, contextLogger); reason != "" {
+		return unusable(reason)
+	}
+
+	if reason := checkPriorWALSummaries(ctx, sqlConn, prior, contextLogger); reason != "" {
+		return unusable(reason)
+	}
+
+	manifest, reason, err := loadPriorManifest(ctx, tier1, hostname, prior)
+	if err != nil {
+		return false, err
+	}
+	if reason != "" {
+		return unusable(reason)
+	}
+
+	executorOpts.PreviousManifest = manifest
+	executorOpts.PreviousKopiaManifests = prior.KopiaManifests
+
+	return true, nil
+}
+
+// priorUnusable maps an "unusable prior" reason to the right outcome: a hard
+// error when the prior was named explicitly (the user's request cannot be
+// honored), or a warning plus a full-backup fallback when it was
+// auto-detected.
+func priorUnusable(
+	explicit bool, prior *klioclient.BackupMetadata, reason string, logger log.Logger,
+) (bool, error) {
+	if explicit {
+		return false, fmt.Errorf("%w: %q: %s", ErrPreviousBackupUnusable, prior.Name, reason)
+	}
+	logger.Warning(
+		"Most recent backup cannot serve as an incremental base; falling back to a full backup",
+		"reason", reason, "previousBackup", prior.Name)
+
+	return false, nil
+}
+
+// checkPriorLineage returns a non-empty "unusable" reason when prior belongs to
+// a different cluster lineage than the source server: the repository can still
+// hold backups from a destroyed-and-recreated cluster that reused this hostname,
+// and combining against one would be meaningless (PostgreSQL's UPLOAD_MANIFEST
+// would reject it too). Ancestry on the current timeline history is left to
+// PostgreSQL's WAL summarizer during the incremental BASE_BACKUP. A failure to
+// read the identifier is best effort: it logs and returns "" so the backup falls
+// through to PostgreSQL's own checks.
+func checkPriorLineage(
+	ctx context.Context, sqlConn *pgx.Conn, prior *klioclient.BackupMetadata, logger log.Logger,
+) string {
+	systemID, err := readSystemIdentifier(ctx, sqlConn)
+	if err != nil {
+		logger.Warning(
+			"Could not read the cluster system identifier to validate the incremental base; proceeding",
+			"err", err, "previousBackup", prior.Name)
+
+		return ""
+	}
+
+	_, reason := ValidatePriorForIncremental(prior, systemID)
+
+	return reason
+}
+
+// checkPriorWALSummaries returns a non-empty "unusable" reason when the source
+// server no longer retains the WAL summaries needed to compute an incremental
+// against prior. PostgreSQL prunes them after wal_summary_keep_time, after which
+// it would fail the BASE_BACKUP INCREMENTAL; detecting it here lets an
+// auto-detected prior degrade to a full backup with a clear reason. The query is
+// best effort: a failure (for example on PostgreSQL < 17, where the function does
+// not exist) logs and returns "", leaving the definitive gate to the executor.
+func checkPriorWALSummaries(
+	ctx context.Context, sqlConn *pgx.Conn, prior *klioclient.BackupMetadata, logger log.Logger,
+) string {
+	retained, err := priorWALSummariesRetained(ctx, sqlConn, prior)
+	if err != nil {
+		logger.Warning(
+			"Could not verify WAL summary availability for the incremental base; proceeding",
+			"err", err, "previousBackup", prior.Name)
+
+		return ""
+	}
+	if !retained {
+		return "WAL summaries covering the previous backup are not available " +
+			"(check summarize_wal and wal_summary_keep_time on the source cluster)"
+	}
+
+	return ""
+}
+
+// loadPriorManifest reads the stored backup_manifest for prior. A missing
+// manifest yields a non-empty "unusable" reason; a genuine repository failure is
+// returned as the error.
+func loadPriorManifest(
+	ctx context.Context, tier1 ProtocolUploader, hostname string, prior *klioclient.BackupMetadata,
+) ([]byte, string, error) {
+	manifest, err := tier1.GetBackupManifest(ctx, hostname, prior.Name)
+	if err != nil {
+		if _, ok := errors.AsType[kopiaconn.NoBackupFoundError](err); ok {
+			return nil, "no stored backup_manifest", nil
+		}
+
+		return nil, "", fmt.Errorf("while reading the previous backup manifest from the repository: %w", err)
+	}
+
+	return manifest, "", nil
+}
+
+// priorWALSummariesRetained reports whether the source server still has a WAL
+// summary covering the prior backup's start LSN on its timeline. PostgreSQL
+// needs an unbroken summary chain from that LSN to compute an incremental, and
+// prunes the oldest summaries after wal_summary_keep_time. Checking the old
+// boundary is race-free against summarizer lag, which only affects the newest
+// end of the range.
+func priorWALSummariesRetained(ctx context.Context, sqlConn *pgx.Conn, prior *klioclient.BackupMetadata) (bool, error) {
+	startLSN := string(types.Int64ToLSN(prior.StartLSN))
+
+	var retained bool
+	if err := sqlConn.QueryRow(
+		ctx,
+		`SELECT count(*) > 0 FROM pg_available_wal_summaries() `+
+			`WHERE tli = $1 AND start_lsn <= $2::pg_lsn AND end_lsn >= $2::pg_lsn`,
+		prior.Timeline, startLSN,
+	).Scan(&retained); err != nil {
+		return false, fmt.Errorf("while checking WAL summary availability: %w", err)
+	}
+
+	return retained, nil
+}
+
+// readSystemIdentifier reads the current cluster's system identifier, used to
+// reject an incremental base from a different cluster lineage.
+func readSystemIdentifier(ctx context.Context, sqlConn *pgx.Conn) (int64, error) {
+	var systemID int64
+	if err := sqlConn.QueryRow(
+		ctx, "SELECT system_identifier FROM pg_control_system()",
+	).Scan(&systemID); err != nil {
+		return 0, fmt.Errorf("while reading system identifier: %w", err)
+	}
+
+	return systemID, nil
 }
