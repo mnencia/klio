@@ -90,7 +90,7 @@ func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlock
 		return nil, fmt.Errorf("while opening prior object for %q: %w", relPath, err)
 	}
 
-	return &objectBlockReader{reader: reader, blockSize: blockSize}, nil
+	return &objectBlockReader{reader: reader, blockSize: blockSize, buf: make([]byte, blockSize)}, nil
 }
 
 // resolve walks the directory tree to find the object ID for relPath. Every
@@ -177,6 +177,13 @@ func findEntry(manifest *snapshot.DirManifest, name string) *snapshot.DirEntry {
 type objectBlockReader struct {
 	reader    object.Reader
 	blockSize int
+
+	// buf is reused across ReadBlock calls instead of allocating a fresh
+	// blockSize buffer each time. Safe: the caller (Reconstruct) writes out
+	// each returned block immediately and never retains it, and one
+	// objectBlockReader is only ever driven synchronously from a single
+	// Reconstruct call for one file.
+	buf []byte
 }
 
 // Close releases the underlying Kopia object reader.
@@ -190,10 +197,9 @@ func (o *objectBlockReader) ReadBlock(n uint32) ([]byte, error) {
 		return nil, fmt.Errorf("while seeking prior block %d: %w", n, err)
 	}
 
-	buf := make([]byte, o.blockSize)
-	if _, err := io.ReadFull(o.reader, buf); err != nil {
+	if _, err := io.ReadFull(o.reader, o.buf); err != nil {
 		return nil, fmt.Errorf("while reading prior block %d: %w", n, err)
 	}
 
-	return buf, nil
+	return o.buf, nil
 }
