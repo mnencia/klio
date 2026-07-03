@@ -40,6 +40,7 @@ import (
 var (
 	errInvalidTag                  = errors.New("invalid --tag, expected key=value")
 	errIncrementalRequiresPrevious = errors.New("--incremental requires --previous-manifest")
+	errEmptyRequiredFlag           = errors.New("required flag must not be empty")
 )
 
 // ingestCmd implements the "ingest" subcommand.
@@ -92,6 +93,21 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	host, _ := cmd.Flags().GetString("host")
 	username, _ := cmd.Flags().GetString("username")
 	sourcePath, _ := cmd.Flags().GetString("source-path")
+
+	// MarkFlagRequired only checks that the flag was passed, not that it carries
+	// a value. Reject an empty value so a blank --host cannot produce a snapshot
+	// under an empty SourceInfo identity.
+	for _, f := range []struct{ name, value string }{
+		{"config-file", configFile},
+		{"host", host},
+		{"username", username},
+		{"source-path", sourcePath},
+	} {
+		if f.value == "" {
+			return fmt.Errorf("%w: --%s", errEmptyRequiredFlag, f.name)
+		}
+	}
+
 	incremental, _ := cmd.Flags().GetBool("incremental")
 	blockSize, _ := cmd.Flags().GetInt("block-size")
 	tags, _ := cmd.Flags().GetStringArray("tag")
