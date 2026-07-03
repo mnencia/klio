@@ -62,7 +62,8 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: incremental requires useBaseBackupProtocol to be true
-                  rule: '!has(self.incremental) || !self.incremental || self.useBaseBackupProtocol'
+                  rule: '!has(self.incremental) || !self.incremental || (has(self.useBaseBackupProtocol)
+                    && self.useBaseBackupProtocol)'
               clientSecretName:
                 description: ClientSecretName is the name of the secret containing
                   the client credentials

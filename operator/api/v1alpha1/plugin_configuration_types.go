@@ -171,7 +171,7 @@ type CompressionPolicy struct {
 }
 
 // BackupConfiguration configures how base backups are produced.
-// +kubebuilder:validation:XValidation:rule="!has(self.incremental) || !self.incremental || self.useBaseBackupProtocol",message="incremental requires useBaseBackupProtocol to be true"
+// +kubebuilder:validation:XValidation:rule="!has(self.incremental) || !self.incremental || (has(self.useBaseBackupProtocol) && self.useBaseBackupProtocol)",message="incremental requires useBaseBackupProtocol to be true"
 type BackupConfiguration struct {
 	// UseBaseBackupProtocol sources base backups from the PostgreSQL
 	// BASE_BACKUP streaming-replication protocol and ingests them through the
