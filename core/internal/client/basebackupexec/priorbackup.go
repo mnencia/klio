@@ -45,7 +45,7 @@ func SelectPriorBackup(
 	backups klioclient.BackupList, previousBackupName string,
 ) (*klioclient.BackupMetadata, error) {
 	if previousBackupName == "" {
-		return pickLatestBackup(backups), nil
+		return backups.GetLatestBackup(), nil
 	}
 
 	prior := findBackupByName(backups, previousBackupName)
@@ -82,17 +82,4 @@ func findBackupByName(backups klioclient.BackupList, name string) *klioclient.Ba
 	}
 
 	return nil
-}
-
-// pickLatestBackup returns the backup with the greatest StartedAt, or nil when
-// the list is empty.
-func pickLatestBackup(backups klioclient.BackupList) *klioclient.BackupMetadata {
-	var latest *klioclient.BackupMetadata
-	for i := range backups {
-		if latest == nil || backups[i].StartedAt > latest.StartedAt {
-			latest = &backups[i]
-		}
-	}
-
-	return latest
 }

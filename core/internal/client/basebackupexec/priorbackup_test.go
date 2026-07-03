@@ -62,23 +62,6 @@ func TestSelectPriorBackup(t *testing.T) {
 	})
 }
 
-func TestPickLatestBackup(t *testing.T) {
-	t.Run("empty list returns nil", func(t *testing.T) {
-		assert.Nil(t, pickLatestBackup(nil))
-	})
-
-	t.Run("picks the most recent by StartedAt", func(t *testing.T) {
-		backups := klioclient.BackupList{
-			{Name: "old", StartedAt: 100},
-			{Name: "newest", StartedAt: 300},
-			{Name: "middle", StartedAt: 200},
-		}
-		latest := pickLatestBackup(backups)
-		assert.NotNil(t, latest)
-		assert.Equal(t, "newest", latest.Name)
-	})
-}
-
 func TestValidatePriorForIncremental(t *testing.T) {
 	const systemID int64 = 7123456789012345678
 
