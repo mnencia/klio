@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/cloudnative-pg/machinery/pkg/log"
+	"github.com/cloudnative-pg/machinery/pkg/types"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/spf13/cobra"
@@ -637,8 +638,7 @@ func loadPriorManifest(
 // boundary is race-free against summarizer lag, which only affects the newest
 // end of the range.
 func priorWALSummariesRetained(ctx context.Context, sqlConn *pgx.Conn, prior *klioclient.BackupMetadata) (bool, error) {
-	// pg_lsn text format is the two 32-bit halves in hex, e.g. "1/B374D848".
-	startLSN := fmt.Sprintf("%X/%X", uint32(prior.StartLSN>>32), uint32(prior.StartLSN)) //nolint:gosec // LSN halves
+	startLSN := string(types.Int64ToLSN(prior.StartLSN))
 
 	var retained bool
 	if err := sqlConn.QueryRow(
