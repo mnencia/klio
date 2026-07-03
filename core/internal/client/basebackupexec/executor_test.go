@@ -39,6 +39,11 @@ import (
 // contract used by the executor.
 var _ Uploader = (*kopiaconn.Connection)(nil)
 
+// Compile-time assertion that the Kopia connection satisfies the
+// ProtocolUploader contract used by the BASE_BACKUP protocol CLI
+// orchestration in core/cmd/backup.
+var _ ProtocolUploader = (*kopiaconn.Connection)(nil)
+
 // fakeUploader records the ingest options it is called with, so tests can
 // assert the per-source decisions the executor makes.
 type fakeUploader struct {

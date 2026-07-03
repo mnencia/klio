@@ -77,6 +77,22 @@ type Uploader interface {
 	) error
 }
 
+// ProtocolUploader is the subset of the Kopia connection the BASE_BACKUP
+// protocol CLI orchestration needs: everything Uploader needs, plus checking
+// helper availability and reading a prior backup's manifest. It is
+// implemented by *kopia.Connection.
+type ProtocolUploader interface {
+	Uploader
+
+	// SupportsBaseBackupIngestion reports whether the kopia-pgbasebackup
+	// helper is available on this connection.
+	SupportsBaseBackupIngestion() bool
+
+	// GetBackupManifest retrieves a prior backup's persisted PostgreSQL
+	// backup_manifest, used as the UPLOAD_MANIFEST base for an incremental.
+	GetBackupManifest(ctx context.Context, hostname, backupName string) ([]byte, error)
+}
+
 // Executor runs a BASE_BACKUP-sourced backup.
 type Executor struct {
 	// repConn is a replication connection used for the BASE_BACKUP and

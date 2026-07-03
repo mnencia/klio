@@ -401,7 +401,7 @@ func runViaBaseBackupProtocol(
 	kopiaClient *kopia.MultiConnection,
 	opts baseBackupProtocolOptions,
 ) (*klioclient.BackupMetadata, error) {
-	tier1, ok := kopiaClient.Tier1.(*kopia.Connection)
+	tier1, ok := kopiaClient.Tier1.(basebackupexec.ProtocolUploader)
 	if !ok || tier1 == nil {
 		return nil, cli.NewCodedError(
 			ErrProtocolRequiresTier1,
@@ -478,7 +478,7 @@ func runViaBaseBackupProtocol(
 func resolvePreviousBackup(
 	ctx context.Context,
 	kopiaClient *kopia.MultiConnection,
-	tier1 *kopia.Connection,
+	tier1 basebackupexec.ProtocolUploader,
 	sqlConn *pgx.Conn,
 	hostname string,
 	opts baseBackupProtocolOptions,
@@ -614,7 +614,7 @@ func checkPriorWALSummaries(
 // manifest yields a non-empty "unusable" reason; a genuine repository failure is
 // returned as the error.
 func loadPriorManifest(
-	ctx context.Context, tier1 *kopia.Connection, hostname string, prior *klioclient.BackupMetadata,
+	ctx context.Context, tier1 basebackupexec.ProtocolUploader, hostname string, prior *klioclient.BackupMetadata,
 ) ([]byte, string, error) {
 	manifest, err := tier1.GetBackupManifest(ctx, hostname, prior.Name)
 	if err != nil {
