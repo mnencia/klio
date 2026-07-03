@@ -107,19 +107,16 @@ func runBackup(cmd *cobra.Command, _ []string) error {
 
 	waitWALs, _ := cmd.Flags().GetBool("wait-for-wals")
 	tier2, _ := cmd.Flags().GetBool("enable-tier2-backup")
-	useProtocol, _ := cmd.Flags().GetBool("use-base-backup-protocol")
-	incremental, _ := cmd.Flags().GetBool("incremental")
 	previousBackupName, _ := cmd.Flags().GetString("previous-backup-name")
 	backupName, _ := cmd.Flags().GetString("name")
 
-	// When the CLI flags are not explicitly set, fall back to the values
-	// configured by the operator in the Klio configuration. When neither is
-	// set, klio keeps using the filesystem-snapshot path (the historical
-	// default), so existing deployments are unaffected.
-	useProtocol = resolveBackupOption(
-		cmd.Flags().Changed("use-base-backup-protocol"), useProtocol, configuration.Backup.UseBaseBackupProtocol)
-	incremental = resolveBackupOption(
-		cmd.Flags().Changed("incremental"), incremental, configuration.Backup.Incremental)
+	// use-base-backup-protocol and incremental are bound to the Klio
+	// configuration via viper.BindPFlag (see init()): an explicitly-set CLI
+	// flag overrides the configuration value, otherwise the configuration
+	// value is used, defaulting to false (the historical filesystem-snapshot
+	// path) when neither is set.
+	useProtocol := configuration.Backup.UseBaseBackupProtocol
+	incremental := configuration.Backup.Incremental
 
 	// Naming a previous backup only makes sense when requesting an incremental
 	// backup. Reject the combination loudly instead of silently dropping the
@@ -303,18 +300,6 @@ func marshalTier2CompressionPolicy(ctx context.Context, configuration *config.Da
 	}
 
 	return string(content)
-}
-
-// resolveBackupOption decides the effective value of a backup option. An
-// explicitly-set CLI flag overrides the operator-supplied configuration
-// default; otherwise the configuration value is used. With neither set the
-// configuration default (false) wins, preserving the historical behavior.
-func resolveBackupOption(flagChanged, flagValue, configValue bool) bool {
-	if flagChanged {
-		return flagValue
-	}
-
-	return configValue
 }
 
 // validateIncrementalRequiresProtocol rejects requesting an incremental backup
@@ -688,6 +673,7 @@ func init() {
 		"Take the base backup over the PostgreSQL BASE_BACKUP "+
 			"streaming-replication protocol and ingest it into the Kopia "+
 			"repository through the kopia-pgbasebackup helper.")
+	_ = viper.BindPFlag("backup.use_base_backup_protocol", runCmd.Flags().Lookup("use-base-backup-protocol"))
 
 	runCmd.Flags().Bool(
 		"incremental",
@@ -696,6 +682,7 @@ func init() {
 			"--use-base-backup-protocol and PostgreSQL 17+. The prior "+
 			"backup is detected automatically; when none is usable, klio logs a "+
 			"warning and falls back to a full backup.")
+	_ = viper.BindPFlag("backup.incremental", runCmd.Flags().Lookup("incremental"))
 
 	runCmd.Flags().String(
 		"previous-backup-name",
