@@ -117,6 +117,57 @@ func TestSourceConfigValidate(t *testing.T) {
 	}
 }
 
+func TestBackupConfigValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  BackupConfig
+		wantErr bool
+		substr  string
+	}{
+		{
+			name:    "Valid: neither set",
+			config:  BackupConfig{},
+			wantErr: false,
+		},
+		{
+			name: "Valid: both set",
+			config: BackupConfig{
+				UseBaseBackupProtocol: true,
+				Incremental:           true,
+			},
+			wantErr: false,
+		},
+		{
+			name: "Valid: protocol without incremental",
+			config: BackupConfig{
+				UseBaseBackupProtocol: true,
+			},
+			wantErr: false,
+		},
+		{
+			name: "Invalid: incremental without protocol",
+			config: BackupConfig{
+				Incremental: true,
+			},
+			wantErr: true,
+			substr:  "incremental requires use_base_backup_protocol to be true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && tt.substr != "" && !strings.Contains(err.Error(), tt.substr) {
+				t.Errorf("Validate() error = %v, expected to contain %q", err, tt.substr)
+			}
+		})
+	}
+}
+
 func TestWalRepositoryClientConfigValidate(t *testing.T) {
 	tests := []struct {
 		name         string
