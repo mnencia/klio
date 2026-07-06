@@ -255,16 +255,21 @@ restore uses that flag to pick the right path.
 
 ### Prerequisites
 
-- `summarize_wal = on` on the source server, with WAL summaries that still cover
-  the range since the prior backup. PostgreSQL prunes summaries after
-  [`wal_summary_keep_time`][pg-wal-summary-keep-time] (10 days by default). Before
-  requesting an incremental, Klio checks that the summary covering the prior
-  backup's start LSN is still present (via `pg_available_wal_summaries()`); if it
-  has been pruned, an auto-detected prior falls back to a full backup and an
-  explicitly named prior fails with a clear error. This mirrors the server-side
-  requirement described in [Making an Incremental Backup][pg-incremental]: "if
-  the necessary files have already been removed [...] the incremental backup will
-  fail".
+- `summarize_wal = on` on the source server. Klio checks this directly (`SELECT
+  current_setting('summarize_wal')`) before selecting a prior backup at all: if
+  it is off, the request fails immediately with a clear error, regardless of
+  whether a usable prior exists or the prior was auto-detected or named
+  explicitly. Incremental is structurally impossible without it, so there is no
+  fallback for this case.
+- WAL summaries that still cover the range since the prior backup. PostgreSQL
+  prunes summaries after [`wal_summary_keep_time`][pg-wal-summary-keep-time] (10
+  days by default). With `summarize_wal` on, Klio checks that the summary
+  covering the prior backup's start LSN is still present (via
+  `pg_available_wal_summaries()`); if it has been pruned, an auto-detected prior
+  falls back to a full backup and an explicitly named prior fails with a clear
+  error. This mirrors the server-side requirement described in [Making an
+  Incremental Backup][pg-incremental]: "if the necessary files have already
+  been removed [...] the incremental backup will fail".
 - A stored `backup_manifest` from the prior backup. Every backup captures one
   via `MANIFEST 'yes'`.
 
@@ -368,11 +373,17 @@ backup; `--previous-backup-name` selects a specific one.
 For an automatically chosen prior, incremental is best-effort: Klio falls back
 to a full backup when it cannot use the prior. This happens when there is no
 previous backup, when the prior came from the filesystem path and has no Kopia
-manifest references, when the prior belongs to a different cluster lineage, or
-when its stored manifest is missing. When `--previous-backup-name` names a
-backup that does not exist or cannot serve as a base, that is an error: an
-explicit request cannot be honored silently. Repository errors are always
-errors.
+manifest references, when the prior belongs to a different cluster lineage,
+when its stored manifest is missing, or when the WAL summaries covering it
+have been pruned past `wal_summary_keep_time`. When `--previous-backup-name`
+names a backup that does not exist or cannot serve as a base, that is an
+error: an explicit request cannot be honored silently. Repository errors are
+always errors.
+
+A disabled `summarize_wal` is not part of this best-effort list: it fails the
+request unconditionally, before prior selection even runs, since no choice of
+prior backup can make incremental possible on a server that never produces WAL
+summaries at all (see [Prerequisites](#prerequisites)).
 
 ## WAL handling
 

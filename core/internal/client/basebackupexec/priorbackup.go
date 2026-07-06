@@ -40,6 +40,13 @@ var (
 	// ErrPreviousBackupUnusable is returned when an explicitly requested previous
 	// backup cannot serve as an incremental base.
 	ErrPreviousBackupUnusable = errors.New("the requested previous backup cannot serve as an incremental base")
+
+	// ErrSummarizeWALDisabled is returned when an incremental backup is
+	// requested but summarize_wal is off on the source cluster. Incremental is
+	// structurally impossible here regardless of which prior backup would
+	// otherwise be chosen, so this fails unconditionally instead of falling
+	// back to a full backup.
+	ErrSummarizeWALDisabled = errors.New("summarize_wal is disabled on the source cluster; incremental backups require it")
 )
 
 // SelectPriorBackup chooses the backup to use as the incremental base: the one
@@ -119,6 +126,10 @@ func ResolvePriorForIncremental(
 ) (bool, error) {
 	contextLogger := log.FromContext(ctx)
 
+	if err := requireSummarizeWALEnabled(ctx, sqlConn); err != nil {
+		return false, err
+	}
+
 	backups, err := lister.ListBackups(ctx, hostname)
 	if err != nil {
 		return false, fmt.Errorf("while listing backups: %w", err)
@@ -187,6 +198,29 @@ func priorUnusable(
 		"reason", reason, "previousBackup", prior.Name)
 
 	return false, nil
+}
+
+// requireSummarizeWALEnabled hard-fails when summarize_wal is off: the source
+// server can never produce the WAL summaries an incremental BASE_BACKUP needs,
+// regardless of which prior backup would otherwise be chosen. A failure to
+// read the setting is best effort: it logs and returns nil so the backup
+// falls through to the existing summary-availability check and ultimately to
+// PostgreSQL's own gate.
+func requireSummarizeWALEnabled(ctx context.Context, sqlConn *pgx.Conn) error {
+	var enabled bool
+	if err := sqlConn.QueryRow(
+		ctx, "SELECT current_setting('summarize_wal')::boolean",
+	).Scan(&enabled); err != nil {
+		log.FromContext(ctx).Warning(
+			"Could not verify summarize_wal on the source cluster; proceeding", "err", err)
+
+		return nil
+	}
+	if !enabled {
+		return ErrSummarizeWALDisabled
+	}
+
+	return nil
 }
 
 // checkPriorLineage returns a non-empty "unusable" reason when prior belongs to
