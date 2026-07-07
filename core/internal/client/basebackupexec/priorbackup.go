@@ -193,7 +193,7 @@ func resolveCombineBase(
 		return nil, reason, err
 	}
 
-	reason, err = verifyPriorPgdataExists(ctx, tier1, prior)
+	reason, err = verifyPriorSnapshotsExist(ctx, tier1, prior)
 	if err != nil || reason != "" {
 		return nil, reason, err
 	}
@@ -292,30 +292,65 @@ func checkPriorWALSummaries(
 	return ""
 }
 
-// verifyPriorPgdataExists confirms prior's pgdata Kopia snapshot still
-// exists, as a go/no-go signal for attempting incremental at all: if
-// pgdata's own combine base is already gone, nothing meaningful would be
-// incremental anyway. This is a live, tag-based existence check (see
-// kopia.Connection.getSnapshotID) — the manifest ID it resolves is
-// discarded, never used as a combine base, since it is not stable across
-// pin/unpin (the actual combine base is resolved by kopia-pgbasebackup
-// itself, atomically, by backup name, immediately before use — see
-// executor.go's makeHandler). A non-empty reason means prior is unusable; a
-// nil error with an empty reason means pgdata's snapshot is confirmed
-// present.
-func verifyPriorPgdataExists(
+// verifyPriorSnapshotsExist confirms every Kopia snapshot prior contributes as
+// a combine base — its pgdata and each of its tablespaces — still exists, as a
+// go/no-go signal for attempting incremental at all. The whole prior
+// backup_manifest is uploaded to PostgreSQL before the single incremental
+// BASE_BACKUP runs, so PostgreSQL streams every file it lists in incremental
+// form with no per-source fallback once streaming starts; a single missing
+// combine base therefore dooms the entire attempt and must be caught here,
+// before UPLOAD_MANIFEST. A non-empty reason means prior is unusable; a nil
+// error with an empty reason means all snapshots are confirmed present.
+func verifyPriorSnapshotsExist(
 	ctx context.Context, tier1 ProtocolUploader, prior *klioclient.BackupMetadata,
 ) (string, error) {
-	_, err := tier1.ResolveManifestID(ctx, map[string]string{
+	reason, err := priorSnapshotExists(ctx, tier1, map[string]string{
 		klioclient.BackupContentTagName: "pgdata",
 		klioclient.BackupNameTagName:    prior.Name,
-	})
-	if err != nil {
+	}, "pgdata")
+	if err != nil || reason != "" {
+		return reason, err
+	}
+
+	// A tablespace snapshot is a separate Kopia source, so it can be lost
+	// independently of pgdata (a partial DeleteBackup failure, or per-source
+	// retention). Keying on the tablespace name (not the OID that
+	// kopia-pgbasebackup ultimately combines by) is safe here because this is a
+	// prior-vs-prior check: prior's TablespaceLayout.Name and its snapshot's
+	// tablespace-name tag both come from the same env.tablespaceName lookup at
+	// prior's backup time and are frozen together, so this is not the
+	// rename-sensitivity that keying the combine base by name would reintroduce.
+	for _, tbl := range prior.Tablespaces {
+		reason, err = priorSnapshotExists(ctx, tier1, map[string]string{
+			klioclient.BackupContentTagName:  "tablespace",
+			klioclient.TablespaceNameTagName: tbl.Name,
+			klioclient.BackupNameTagName:     prior.Name,
+		}, fmt.Sprintf("tablespace %q", tbl.Name))
+		if err != nil || reason != "" {
+			return reason, err
+		}
+	}
+
+	return "", nil
+}
+
+// priorSnapshotExists is a live, tag-based existence check for one of prior's
+// combine-base snapshots (see kopia.Connection.getSnapshotID). The manifest ID
+// it resolves is discarded, never used as a combine base, since it is not
+// stable across pin/unpin (the actual combine base is resolved by
+// kopia-pgbasebackup itself, atomically, by backup name, immediately before
+// use — see executor.go's makeHandler). describe names the snapshot for the
+// unusable reason. A non-empty reason means the snapshot is gone; a nil error
+// with an empty reason means it is confirmed present.
+func priorSnapshotExists(
+	ctx context.Context, tier1 ProtocolUploader, tags map[string]string, describe string,
+) (string, error) {
+	if _, err := tier1.ResolveManifestID(ctx, tags); err != nil {
 		if _, ok := errors.AsType[kopiaconn.NoSnapshotFoundError](err); ok {
-			return "prior Kopia snapshot for pgdata no longer exists in the repository", nil
+			return fmt.Sprintf("prior Kopia snapshot for %s no longer exists in the repository", describe), nil
 		}
 
-		return "", fmt.Errorf("while verifying prior pgdata snapshot: %w", err)
+		return "", fmt.Errorf("while verifying prior %s snapshot: %w", describe, err)
 	}
 
 	return "", nil
