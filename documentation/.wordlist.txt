@@ -107,6 +107,7 @@ NATS
 Namespaces
 NodeSelector
 OCI
+OID
 OLM
 OLTP
 OTEL
@@ -301,6 +302,7 @@ opentelemetry
 otel
 otlp
 pgbasebackup
+pgdata
 pglogrepl
 pgx
 pgzip
