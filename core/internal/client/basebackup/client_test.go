@@ -282,3 +282,38 @@ func TestParsePositionRow(t *testing.T) {
 	_, _, err = parsePositionRow([][]byte{[]byte("not-an-lsn"), []byte("1")})
 	require.ErrorIs(t, err, ErrMalformedPositionRow)
 }
+
+// TestResultSetClassification is the regression test for classifying
+// BASE_BACKUP result sets by their first column's name rather than by column
+// count: an unrelated result set that merely happens to have the same shape
+// (2 or 3 columns) as a position or tablespace result set must not be
+// misclassified.
+func TestResultSetClassification(t *testing.T) {
+	t.Run("recptr/tli is a start/end result set", func(t *testing.T) {
+		rs := resultSet{columns: []string{"recptr", "tli"}}
+		assert.True(t, isStartEndResultSet(rs))
+		assert.False(t, isTablespaceResultSet(rs))
+	})
+
+	t.Run("spcoid/spclocation/size is a tablespace result set", func(t *testing.T) {
+		rs := resultSet{columns: []string{"spcoid", "spclocation", "size"}}
+		assert.True(t, isTablespaceResultSet(rs))
+		assert.False(t, isStartEndResultSet(rs))
+	})
+
+	t.Run("an unrelated 3-column result set is not a tablespace result set", func(t *testing.T) {
+		rs := resultSet{columns: []string{"foo", "bar", "baz"}}
+		assert.False(t, isTablespaceResultSet(rs))
+	})
+
+	t.Run("an unrelated 2-column result set is not a start/end result set", func(t *testing.T) {
+		rs := resultSet{columns: []string{"foo", "bar"}}
+		assert.False(t, isStartEndResultSet(rs))
+	})
+
+	t.Run("an empty result set matches neither", func(t *testing.T) {
+		rs := resultSet{}
+		assert.False(t, isStartEndResultSet(rs))
+		assert.False(t, isTablespaceResultSet(rs))
+	})
+}

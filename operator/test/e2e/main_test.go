@@ -58,13 +58,9 @@ func TestMain(m *testing.M) {
 	runner.RegisterFeature(RecoverClusterViaBaseBackupProtocol(envconf.RandomName("recovery-via-protocol", 32)))
 	runner.RegisterFeature(RecoverClusterViaIncrementalBackup(envconf.RandomName("recovery-via-incremental", 32)))
 	runner.RegisterFeature(
-		IncrementalFallsBackWithoutSummaries(envconf.RandomName("incremental-fallback-nosummaries", 32)),
-		runner.WithSerialExecution(),
-	)
+		IncrementalFailsWithoutSummarizeWAL(envconf.RandomName("incremental-fails-nosummarize-wal", 32)))
 	runner.RegisterFeature(
-		RecoverClusterViaIncrementalWithNewTablespace(envconf.RandomName("incremental-new-tablespace", 32)),
-		runner.WithSerialExecution(),
-	)
+		RecoverClusterViaIncrementalWithNewTablespace(envconf.RandomName("incremental-new-tablespace", 32)))
 	runner.RegisterFeature(RecoverReplicaCluster(envconf.RandomName("recovery-replica-cluster", 32)))
 	runner.RegisterFeature(RecoverClusterWithTablespaces(envconf.RandomName("recovery-tablespace", 32)))
 	runner.RegisterFeature(RecoverClusterFromPitr(envconf.RandomName("recovery-from-pitr", 32)))

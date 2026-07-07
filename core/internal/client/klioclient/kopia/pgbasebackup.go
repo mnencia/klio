@@ -81,28 +81,24 @@ func (s *Connection) GetBackupManifest(
 	ctx context.Context,
 	hostname, backupName string,
 ) ([]byte, error) {
-	contextLogger := log.FromContext(ctx)
-
-	entries, err := s.kopia.ListSnapshots(ctx, map[string]string{
+	entryID, err := s.getSnapshotID(ctx, map[string]string{
 		klioclient.BackupNameTagName:    backupName,
 		klioclient.BackupContentTagName: "manifest",
-	}, contextLogger.Debug)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("while listing manifest snapshots: %w", err)
-	}
-
-	for _, entry := range entries {
-		if entry.Source.Host == hostname {
-			content, err := s.kopia.RestoreSingleFile(ctx, entry.ID, "backup_manifest", contextLogger.Debug)
-			if err != nil {
-				return nil, fmt.Errorf("while restoring backup manifest: %w", err)
-			}
-
-			return content, nil
+		if _, ok := errors.AsType[NoSnapshotFoundError](err); ok {
+			return nil, newNoBackupFoundError(hostname, backupName)
 		}
+
+		return nil, err
 	}
 
-	return nil, newNoBackupFoundError(hostname, backupName)
+	content, err := s.kopia.RestoreSingleFile(ctx, entryID, "backup_manifest", log.FromContext(ctx).Debug)
+	if err != nil {
+		return nil, fmt.Errorf("while restoring backup manifest: %w", err)
+	}
+
+	return content, nil
 }
 
 // UploadBackupManifest persists the PostgreSQL backup_manifest alongside the

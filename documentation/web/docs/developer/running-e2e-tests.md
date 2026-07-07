@@ -127,11 +127,12 @@ The E2E tests are located in `operator/test/e2e/` and include:
   more data is written, then recovery from the incremental
   (`RecoverClusterViaIncrementalBackup`). Requires `summarize_wal=on` on
   the source cluster (PostgreSQL 17+). Also
-  `IncrementalFallsBackWithoutSummaries`: the negative path, where a
-  cluster with `summarize_wal` off makes an incremental request fall back
-  to a full backup instead of failing.
+  `IncrementalFailsWithoutSummarizeWAL`: the negative path, where a
+  cluster with `summarize_wal` off makes an incremental request fail
+  outright, since incremental is structurally impossible regardless of
+  whether a usable prior backup exists.
 - **`incremental_tablespace_test.go`** - the per-source incremental
-  decision (`RecoverClusterViaIncrementalWithNewTablespace`, serial): a
+  decision (`RecoverClusterViaIncrementalWithNewTablespace`): a
   tablespace is added to the source cluster only after the full backup,
   so on the incremental backup the main data directory is ingested
   incrementally while the new tablespace is ingested as a full source.

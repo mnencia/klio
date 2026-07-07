@@ -46,6 +46,10 @@ func (d *Data) Validate() error {
 		errs = errors.Join(errs, err)
 	}
 
+	if err := d.Backup.Validate(); err != nil {
+		errs = errors.Join(errs, err)
+	}
+
 	return errs
 }
 
@@ -91,6 +95,18 @@ func (c *ClientConfig) Validate() error {
 		if err := c.Wal.Validate(); err != nil {
 			errs = errors.Join(errs, err)
 		}
+	}
+
+	return errs
+}
+
+// Validate implements a custom validation function for BackupConfig.
+func (b *BackupConfig) Validate() error {
+	var errs error
+
+	if b.Incremental && !b.UseBaseBackupProtocol {
+		errs = errors.Join(errs, errors.New(
+			"invalid backup config: incremental requires use_base_backup_protocol to be true"))
 	}
 
 	return errs

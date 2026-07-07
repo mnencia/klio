@@ -34,6 +34,17 @@ var ErrIncrementalRequiresManifest = errors.New("incremental backup requires a p
 // UPLOAD_MANIFEST or the INCREMENTAL BASE_BACKUP option.
 var ErrIncrementalRequiresPG17 = errors.New("incremental backup requires PostgreSQL 17 or newer")
 
+// ErrUnknownTablespace is returned when a tablespace archive's OID has no
+// corresponding name in the environment's tablespace list. The name comes
+// from a pg_tablespace query taken before the BASE_BACKUP protocol call,
+// which independently reports its own OID/path list later in the same run;
+// an unknown OID means a tablespace was created or renamed in between. That
+// is not safe to ignore: an empty name would tag the resulting snapshot
+// indistinguishably from any other tablespace hitting the same race, and
+// restore's tag-based snapshot lookup could then pick the wrong one. Failing
+// here instead makes that collision structurally impossible.
+var ErrUnknownTablespace = errors.New("tablespace has no known name (created or renamed during the backup)")
+
 // pg17VersionNum is the server_version_num for the first PostgreSQL release that
 // supports incremental BASE_BACKUP.
 const pg17VersionNum = 170000
@@ -72,6 +83,18 @@ type environment struct {
 
 	// tablespaceNames maps a tablespace OID to its name.
 	tablespaceNames map[string]string
+}
+
+// tablespaceName returns the name recorded for oid when the environment was
+// read. See ErrUnknownTablespace for why an unknown OID is an error rather
+// than an empty name.
+func (env *environment) tablespaceName(oid string) (string, error) {
+	name, ok := env.tablespaceNames[oid]
+	if !ok {
+		return "", fmt.Errorf("%w: OID %q", ErrUnknownTablespace, oid)
+	}
+
+	return name, nil
 }
 
 // readEnvironment collects the metadata needed to assemble the backup result.

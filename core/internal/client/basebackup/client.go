@@ -51,9 +51,10 @@ var (
 	// truncated stream that carried no data as a successful backup.
 	ErrMainArchiveNotReceived = errors.New("BASE_BACKUP did not send the main data directory archive")
 
-	// ErrDuplicateTablespaceSet is returned when more than one tablespace-shaped
-	// result set arrives. Result sets are classified by shape, so a second
-	// 3-column set would otherwise silently overwrite the real tablespace list.
+	// ErrDuplicateTablespaceSet is returned when more than one tablespace result
+	// set arrives. Result sets are classified by their first column name, so a
+	// second spcoid-keyed set would otherwise silently overwrite the real
+	// tablespace list.
 	ErrDuplicateTablespaceSet = errors.New("BASE_BACKUP sent more than one tablespace result set")
 
 	// ErrUnexpectedArchive is returned when an archive name is malformed or names
@@ -304,8 +305,8 @@ type runState struct {
 
 const (
 	startEndColumnCount    = 2
-	tablespaceColumnCount  = 3
 	startPositionColumnTag = "recptr"
+	tablespaceOIDColumnTag = "spcoid"
 )
 
 func (s *runState) handleResultSet(rs resultSet) error {
@@ -321,15 +322,11 @@ func (s *runState) handleResultSet(rs resultSet) error {
 }
 
 func isStartEndResultSet(rs resultSet) bool {
-	if len(rs.columns) != startEndColumnCount {
-		return false
-	}
-
-	return strings.EqualFold(rs.columns[0], startPositionColumnTag)
+	return len(rs.columns) > 0 && strings.EqualFold(rs.columns[0], startPositionColumnTag)
 }
 
 func isTablespaceResultSet(rs resultSet) bool {
-	return len(rs.columns) == tablespaceColumnCount
+	return len(rs.columns) > 0 && strings.EqualFold(rs.columns[0], tablespaceOIDColumnTag)
 }
 
 func (s *runState) handleStartEndResultSet(rs resultSet) error {

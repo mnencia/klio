@@ -28,15 +28,22 @@ import (
 // Binary is name of the Kopia executable.
 const Binary = "kopia"
 
+// lookupBinary finds a named executable in the system PATH and returns its
+// absolute path. Shared by LookupBinary and LookupPgBaseBackupBinary, which
+// only differ in which binary name they look up.
+func lookupBinary(name string) (string, error) {
+	binary, err := exec.LookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("%s binary not found (%q): %w", name, name, err)
+	}
+
+	return binary, nil
+}
+
 // LookupBinary finds the Kopia binary in the system PATH and returns its absolute path.
 // Returns an error if the binary is not found.
 func LookupBinary() (string, error) {
-	kopiaBinary, err := exec.LookPath(Binary)
-	if err != nil {
-		return "", fmt.Errorf("kopia binary not found (%q): %w", Binary, err)
-	}
-
-	return kopiaBinary, nil
+	return lookupBinary(Binary)
 }
 
 // Client is a wrapper around the Kopia CLI.
@@ -51,15 +58,24 @@ type Client struct {
 	Password string
 }
 
-func (s *Client) kopiaEnvironmentVariables() []string {
+// kopiaEnvironment builds the environment for a Kopia (or kopia-pgbasebackup)
+// subprocess: the current environment plus update-check suppression and, when
+// set, the repository password. Shared by Client.kopiaEnvironmentVariables and
+// PgBaseBackupClient.environmentVariables, which only differ in which
+// password field they read.
+func kopiaEnvironment(password string) []string {
 	result := os.Environ()
 	result = append(result, "KOPIA_CHECK_FOR_UPDATES=false")
-	if s.Password != "" {
-		result = append(result, "KOPIA_PASSWORD="+s.Password)
+	if password != "" {
+		result = append(result, "KOPIA_PASSWORD="+password)
 	}
 	result = append(result, tracingEnvironmentVariables()...)
 
 	return result
+}
+
+func (s *Client) kopiaEnvironmentVariables() []string {
+	return kopiaEnvironment(s.Password)
 }
 
 // CommonRepoOpts contains common options for repository operations.

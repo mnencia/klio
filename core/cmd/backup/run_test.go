@@ -20,48 +20,100 @@ SPDX-License-Identifier: Apache-2.0
 package backup
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/cloudnative-pg/klio/core/pkg/config"
 )
-
-func TestResolveBackupOption(t *testing.T) {
-	t.Run("default (no flag, no config) keeps the historical path", func(t *testing.T) {
-		// flag not changed, config false -> false (filesystem-snapshot path).
-		assert.False(t, resolveBackupOption(false, false, false))
-	})
-
-	t.Run("operator configuration opts in", func(t *testing.T) {
-		// flag not changed, config true -> true.
-		assert.True(t, resolveBackupOption(false, false, true))
-	})
-
-	t.Run("explicit flag overrides configuration (force on)", func(t *testing.T) {
-		assert.True(t, resolveBackupOption(true, true, false))
-	})
-
-	t.Run("explicit flag overrides configuration (force off)", func(t *testing.T) {
-		assert.False(t, resolveBackupOption(true, false, true))
-	})
-}
 
 func TestValidateIncrementalRequiresProtocol(t *testing.T) {
 	t.Run("incremental without protocol is rejected", func(t *testing.T) {
-		err := validateIncrementalRequiresProtocol(true, "", false)
-		require.ErrorIs(t, err, ErrIncrementalRequiresProtocol)
-	})
-
-	t.Run("previous backup name without protocol is rejected", func(t *testing.T) {
-		err := validateIncrementalRequiresProtocol(false, "base-1", false)
+		err := validateIncrementalRequiresProtocol(true, false)
 		require.ErrorIs(t, err, ErrIncrementalRequiresProtocol)
 	})
 
 	t.Run("incremental with protocol is allowed", func(t *testing.T) {
-		require.NoError(t, validateIncrementalRequiresProtocol(true, "base-1", true))
+		require.NoError(t, validateIncrementalRequiresProtocol(true, true))
 	})
 
 	t.Run("neither requested is allowed", func(t *testing.T) {
-		require.NoError(t, validateIncrementalRequiresProtocol(false, "", false))
+		require.NoError(t, validateIncrementalRequiresProtocol(false, false))
 	})
+}
+
+func TestValidatePreviousBackupNameRequiresIncremental(t *testing.T) {
+	t.Run("previous backup name without incremental is rejected", func(t *testing.T) {
+		err := validatePreviousBackupNameRequiresIncremental(false, "base-1")
+		require.ErrorIs(t, err, ErrPreviousBackupNameRequiresIncremental)
+	})
+
+	t.Run("previous backup name with incremental is allowed", func(t *testing.T) {
+		require.NoError(t, validatePreviousBackupNameRequiresIncremental(true, "base-1"))
+	})
+
+	t.Run("no previous backup name without incremental is allowed", func(t *testing.T) {
+		require.NoError(t, validatePreviousBackupNameRequiresIncremental(false, ""))
+	})
+}
+
+// TestBackupOptionsPreferExplicitFlagOverConfig exercises the exact
+// viper.BindPFlag wiring init() sets up for use-base-backup-protocol: an
+// explicitly-set CLI flag must win over the configuration value in both
+// directions (forcing on and forcing off), and the configuration value must
+// be used when the flag is left at its default. Uses an isolated viper
+// instance so it can't leak state into other tests or the package's real
+// runCmd.
+func TestBackupOptionsPreferExplicitFlagOverConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		configYAML string
+		flagArgs   []string
+		want       bool
+	}{
+		{
+			name: "neither flag nor config set keeps the historical default off",
+			want: false,
+		},
+		{
+			name:       "configuration value is used when the flag is not set",
+			configYAML: "backup:\n  use_base_backup_protocol: true\n",
+			want:       true,
+		},
+		{
+			name:       "explicit flag forces it on over a false configuration",
+			configYAML: "backup:\n  use_base_backup_protocol: false\n",
+			flagArgs:   []string{"--use-base-backup-protocol=true"},
+			want:       true,
+		},
+		{
+			name:       "explicit flag forces it off over a true configuration",
+			configYAML: "backup:\n  use_base_backup_protocol: true\n",
+			flagArgs:   []string{"--use-base-backup-protocol=false"},
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := viper.New()
+			v.SetConfigType("yaml")
+			if tt.configYAML != "" {
+				require.NoError(t, v.ReadConfig(strings.NewReader(tt.configYAML)))
+			}
+
+			fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+			fs.Bool("use-base-backup-protocol", false, "")
+			require.NoError(t, v.BindPFlag("backup.use_base_backup_protocol", fs.Lookup("use-base-backup-protocol")))
+			require.NoError(t, fs.Parse(tt.flagArgs))
+
+			var configuration config.Data
+			require.NoError(t, v.Unmarshal(&configuration))
+			assert.Equal(t, tt.want, configuration.Backup.UseBaseBackupProtocol)
+		})
+	}
 }

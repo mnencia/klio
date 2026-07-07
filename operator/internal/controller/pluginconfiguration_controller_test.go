@@ -319,4 +319,39 @@ var _ = Describe("PluginConfiguration Controller", func() {
 			Expect(result).To(Equal(reconcile.Result{}))
 		})
 	})
+
+	Context("When the BackupConfiguration is invalid", func() {
+		It("rejects incremental without useBaseBackupProtocol with a clear message", func() {
+			pc := &kliov1alpha1.PluginConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pc-invalid-backup",
+					Namespace: "default",
+				},
+				Spec: kliov1alpha1.PluginConfigurationSpec{
+					ServerAddress:    "klio-server.default",
+					ClientSecretName: "client-tls",
+					ServerSecretName: "server-tls",
+					ClusterName:      "test-cluster",
+					Mode:             kliov1alpha1.ModeStandard,
+					Tier2: &kliov1alpha1.Tier2PluginConfiguration{
+						EnableBackup:   true,
+						EnableRecovery: true,
+					},
+					Backup: &kliov1alpha1.BackupConfiguration{
+						Incremental: true,
+					},
+				},
+			}
+
+			err := k8sClient.Create(ctx, pc)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("incremental requires useBaseBackupProtocol to be true"))
+			// The API server appends the authored message even when the CEL rule
+			// itself crashes evaluating an unguarded optional field, so asserting
+			// on the message alone isn't enough to catch a regression here: it
+			// would still contain the message, prefixed with a raw CEL runtime
+			// error ("no such key: ..."). Assert the rejection is clean.
+			Expect(err.Error()).NotTo(ContainSubstring("no such key"))
+		})
+	})
 })

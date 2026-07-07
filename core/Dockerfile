@@ -15,6 +15,7 @@ WORKDIR /workspace
 # than a branch tip, which can move) keeps the CLI and the library at identical
 # fork state and makes the image reproducible.
 ARG KOPIA_FORK_COMMIT=5d68ae99563555aaf95ab162cd659e82aff844f7
+# TODO: switch to --revision option when the golang image includes git 2.49.0
 RUN --mount=type=cache,target=/go/pkg/mod,id=kopia-mod-${TARGETARCH} \
     --mount=type=cache,target=/root/.cache/go-build,id=kopia-build-${TARGETARCH} \
     mkdir kopia && cd kopia && \

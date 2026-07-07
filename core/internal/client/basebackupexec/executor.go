@@ -76,6 +76,29 @@ type Uploader interface {
 	) error
 }
 
+// ProtocolUploader is the subset of the Kopia connection the BASE_BACKUP
+// protocol CLI orchestration needs: everything Uploader needs, plus checking
+// helper availability and reading a prior backup's manifest. It is
+// implemented by *kopia.Connection.
+type ProtocolUploader interface {
+	Uploader
+
+	// SupportsBaseBackupIngestion reports whether the kopia-pgbasebackup
+	// helper is available on this connection.
+	SupportsBaseBackupIngestion() bool
+
+	// GetBackupManifest retrieves a prior backup's persisted PostgreSQL
+	// backup_manifest, used as the UPLOAD_MANIFEST base for an incremental.
+	GetBackupManifest(ctx context.Context, hostname, backupName string) ([]byte, error)
+
+	// ResolveManifestID confirms a snapshot matching tags currently exists,
+	// returning its Kopia manifest ID. Used only as a go/no-go existence
+	// check (see priorbackup.go's verifyPriorPgdataExists) — the returned ID
+	// is never stored or used as a combine base, since it is not stable
+	// across pin/unpin.
+	ResolveManifestID(ctx context.Context, tags map[string]string) (string, error)
+}
+
 // Executor runs a BASE_BACKUP-sourced backup.
 type Executor struct {
 	// repConn is a replication connection used for the BASE_BACKUP and
@@ -114,11 +137,12 @@ type Options struct {
 	// UPLOAD_MANIFEST before an incremental BASE_BACKUP.
 	PreviousManifest []byte
 
-	// PreviousKopiaManifests maps a source path to the prior snapshot's Kopia
-	// manifest IDs, passed to the helper so it can combine the incremental
-	// against the prior full image. Resolving these from the repository is the
-	// caller's responsibility.
-	PreviousKopiaManifests map[string][]string
+	// PreviousBackup is the prior backup being combined against. Each
+	// source's combine base is identified to the kopia-pgbasebackup helper
+	// by this backup's name alone (see makeHandler) — no Kopia-internal
+	// identifier is resolved or stored here; the helper resolves its own
+	// combine-base snapshot by tag, atomically, immediately before use.
+	PreviousBackup *klioclient.BackupMetadata
 }
 
 // Run executes the backup and returns its assembled metadata.
@@ -146,11 +170,7 @@ func (e *Executor) Run(ctx context.Context, opts Options) (*klioclient.BackupMet
 		}
 	}
 
-	// kopiaManifests records the Kopia snapshot manifest ID produced for each
-	// source. It is persisted in the metadata so a later incremental backup can
-	// use it as the combine base.
-	kopiaManifests := map[string]string{}
-	handler := e.makeHandler(name, env, opts, kopiaManifests)
+	handler := e.makeHandler(name, env, opts)
 
 	contextLogger.Info("Starting BASE_BACKUP", "name", name, "incremental", opts.Incremental)
 	result, err := basebackup.Run(ctx, e.repConn, basebackup.Options{
@@ -163,8 +183,10 @@ func (e *Executor) Run(ctx context.Context, opts Options) (*klioclient.BackupMet
 		return nil, fmt.Errorf("while running BASE_BACKUP: %w", err)
 	}
 
-	metadata := e.buildMetadata(name, startedAt, env, result, opts.Incremental)
-	metadata.KopiaManifests = kopiaManifests
+	metadata, err := e.buildMetadata(name, startedAt, env, result, opts.Incremental)
+	if err != nil {
+		return nil, err
+	}
 	// BASE_BACKUP ships backup_label, tablespace_map and global/pg_control
 	// inside the data tar, so the restored tree is self-contained.
 	metadata.SelfContainedPgData = true
@@ -182,30 +204,34 @@ func (e *Executor) Run(ctx context.Context, opts Options) (*klioclient.BackupMet
 	return metadata, nil
 }
 
-// makeHandler returns the per-source ingest handler. It records each source's
-// resulting Kopia manifest ID into kopiaManifests.
+// makeHandler returns the per-source ingest handler.
 func (e *Executor) makeHandler(
 	name string,
 	env *environment,
 	opts Options,
-	kopiaManifests map[string]string,
 ) basebackup.DataSourceHandler {
 	return func(ctx context.Context, src basebackup.DataSource, tar io.Reader) error {
-		key, sourcePath, tags := sourceDescriptor(src, name, env)
+		key, sourcePath, tags, err := sourceDescriptor(src, name, env)
+		if err != nil {
+			return err
+		}
 
 		// Incremental is decided per source, not per backup. A source that has no
 		// prior combine base (for example a tablespace created after the previous
 		// backup) is ingested as a full source even during an incremental backup:
 		// PostgreSQL streams its files in full, and passing --incremental with no
-		// --previous-manifest would fail the helper.
-		previousManifests := opts.PreviousKopiaManifests[key]
-		srcIncremental := opts.Incremental && len(previousManifests) > 0
+		// --previous-backup-name would fail the helper.
+		previousBackupName := ""
+		if opts.Incremental && opts.PreviousBackup != nil && sourceExistedInPrior(key, opts.PreviousBackup) {
+			previousBackupName = opts.PreviousBackup.Name
+		}
+		srcIncremental := opts.Incremental && previousBackupName != ""
 
 		ingestOpts := kopia.IngestOptions{
-			SourcePath:        sourcePath,
-			Tags:              tags,
-			Incremental:       srcIncremental,
-			PreviousManifests: previousManifests,
+			SourcePath:         sourcePath,
+			Tags:               tags,
+			Incremental:        srcIncremental,
+			PreviousBackupName: previousBackupName,
 		}
 
 		res, err := e.uploader.IngestBaseBackup(ctx, tar, ingestOpts)
@@ -213,20 +239,34 @@ func (e *Executor) makeHandler(
 			return fmt.Errorf("while ingesting source %q: %w", sourcePath, err)
 		}
 
-		// basebackup.Run invokes the handler sequentially, one COPY stream at a
-		// time, so this map write needs no synchronization.
-		kopiaManifests[key] = res.ManifestID
-
 		log.FromContext(ctx).Info("Ingested BASE_BACKUP source",
 			"sourceKey", key,
 			"sourcePath", sourcePath,
-			"manifestId", res.ManifestID,
 			"hashedBytes", res.Stats.HashedBytes,
 			"cachedBytes", res.Stats.CachedBytes,
 		)
 
 		return nil
 	}
+}
+
+// sourceExistedInPrior reports whether prior had a source matching key:
+// pgdata always did, for any completed backup; a tablespace only if its OID
+// appears in prior.Tablespaces. Used to decide whether a source has a
+// combine base at all, without needing any Kopia-internal identifier. A
+// tablespace created after prior was taken correctly reports false, so the
+// source is ingested as full.
+func sourceExistedInPrior(key string, prior *klioclient.BackupMetadata) bool {
+	if key == mainDataSourceKey {
+		return true
+	}
+	for _, tbl := range prior.Tablespaces {
+		if "/tablespace/"+tbl.Oid == key {
+			return true
+		}
+	}
+
+	return false
 }
 
 // mainDataSourceKey is the stable combine-base key for the main data directory.
@@ -243,21 +283,26 @@ const mainDataSourceKey = "pgdata"
 // for tablespaces.
 func sourceDescriptor(
 	src basebackup.DataSource, name string, env *environment,
-) (string, string, map[string]string) {
+) (string, string, map[string]string, error) {
 	if src.IsTablespace {
+		tsName, err := env.tablespaceName(src.TablespaceOID)
+		if err != nil {
+			return "", "", nil, err
+		}
+
 		key := "/tablespace/" + src.TablespaceOID
 
 		return key, key, map[string]string{
 			klioclient.BackupContentTagName:  "tablespace",
-			klioclient.TablespaceNameTagName: env.tablespaceNames[src.TablespaceOID],
+			klioclient.TablespaceNameTagName: tsName,
 			klioclient.BackupNameTagName:     name,
-		}
+		}, nil
 	}
 
 	return mainDataSourceKey, env.pgData, map[string]string{
 		klioclient.BackupContentTagName: "pgdata",
 		klioclient.BackupNameTagName:    name,
-	}
+	}, nil
 }
 
 // buildMetadata assembles BackupMetadata from the protocol result.
@@ -272,16 +317,20 @@ func (e *Executor) buildMetadata(
 	env *environment,
 	result *basebackup.Result,
 	incremental bool,
-) *klioclient.BackupMetadata {
+) (*klioclient.BackupMetadata, error) {
 	tablespaces := make([]klioclient.TablespaceLayout, 0, len(result.Tablespaces))
 	for _, tbl := range result.Tablespaces {
 		if tbl.OID == "" {
 			// The main data directory entry; not a real tablespace.
 			continue
 		}
+		tsName, err := env.tablespaceName(tbl.OID)
+		if err != nil {
+			return nil, err
+		}
 		tablespaces = append(tablespaces, klioclient.TablespaceLayout{
 			Oid:  tbl.OID,
-			Name: env.tablespaceNames[tbl.OID],
+			Name: tsName,
 			Path: tbl.Location,
 		})
 	}
@@ -321,5 +370,5 @@ func (e *Executor) buildMetadata(
 	}
 	metadata.SetAnnotation(BackupMethodAnnotationName, method)
 
-	return metadata
+	return metadata, nil
 }

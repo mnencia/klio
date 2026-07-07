@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"os"
 	"os/exec"
 	"slices"
 
@@ -49,12 +48,7 @@ const PgBaseBackupBinary = "kopia-pgbasebackup"
 // LookupPgBaseBackupBinary finds the kopia-pgbasebackup helper in the system
 // PATH and returns its absolute path. It mirrors LookupBinary for the kopia CLI.
 func LookupPgBaseBackupBinary() (string, error) {
-	binary, err := exec.LookPath(PgBaseBackupBinary)
-	if err != nil {
-		return "", fmt.Errorf("kopia-pgbasebackup binary not found (%q): %w", PgBaseBackupBinary, err)
-	}
-
-	return binary, nil
+	return lookupBinary(PgBaseBackupBinary)
 }
 
 // PgBaseBackupClient wraps the kopia-pgbasebackup helper CLI.
@@ -90,9 +84,12 @@ type IngestOptions struct {
 	// content=pgdata|tablespace, backupName=…
 	Tags map[string]string
 
-	// PreviousManifests holds the prior snapshot manifest IDs used to combine an
-	// incremental backup into a full image.
-	PreviousManifests []string
+	// PreviousBackupName is the prior backup's name, used to combine an
+	// incremental backup into a full image. No Kopia-internal identifier is
+	// passed here: the helper resolves its own combine-base snapshot by tag,
+	// atomically, immediately before use, so there is nothing for a later
+	// pin/unpin (which reassigns manifest IDs) to invalidate.
+	PreviousBackupName string
 
 	// Incremental marks the input tar as an incremental backup.
 	Incremental bool
@@ -138,8 +135,8 @@ func (c *PgBaseBackupClient) Ingest(
 		args = append(args, fmt.Sprintf("--tag=%s=%s", k, opts.Tags[k]))
 	}
 
-	for _, manifest := range opts.PreviousManifests {
-		args = append(args, "--previous-manifest="+manifest)
+	if opts.PreviousBackupName != "" {
+		args = append(args, "--previous-backup-name="+opts.PreviousBackupName)
 	}
 
 	if opts.Incremental {
@@ -160,7 +157,7 @@ func (c *PgBaseBackupClient) Ingest(
 		"sourcePath", opts.SourcePath,
 		"incremental", opts.Incremental,
 		"tagCount", len(opts.Tags),
-		"previousManifestCount", len(opts.PreviousManifests))
+		"previousBackupName", opts.PreviousBackupName)
 
 	if err := RunWithLogCapture(ctx, cmd, &stdout); err != nil {
 		return nil, fmt.Errorf("while ingesting BASE_BACKUP source %q: %w", opts.SourcePath, err)
@@ -175,13 +172,7 @@ func (c *PgBaseBackupClient) Ingest(
 }
 
 func (c *PgBaseBackupClient) environmentVariables() []string {
-	result := os.Environ()
-	result = append(result, "KOPIA_CHECK_FOR_UPDATES=false")
-	if c.Password != "" {
-		result = append(result, "KOPIA_PASSWORD="+c.Password)
-	}
-
-	return result
+	return kopiaEnvironment(c.Password)
 }
 
 // parseIngestResult decodes the single JSON object printed by the helper.

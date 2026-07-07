@@ -195,6 +195,16 @@ func stripIncrementalLabelLines(label []byte) []byte {
 // be found by the same tag queries klio uses on the CLI path.
 const userTagPrefix = "tag:"
 
+// UserTagLabels converts ingest tags into the manifest labels a saved
+// snapshot actually carries (see userTagPrefix): SaveSnapshot stores each
+// Options.Tags entry as a label under this prefix, the same way the kopia
+// CLI does for --tags. A caller resolving a snapshot by these same tags
+// directly through the repository (bypassing the CLI, which applies the
+// prefix itself) must filter on the prefixed keys too.
+func UserTagLabels(tags map[string]string) map[string]string {
+	return userTags(tags)
+}
+
 // userTags returns the tags with each key prefixed for Kopia, matching the
 // kopia CLI convention.
 func userTags(tags map[string]string) map[string]string {

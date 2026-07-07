@@ -243,6 +243,12 @@ exists today; this is a guardrail for the future). Pick identity by use:
   re-listing (`DeleteBackup`; reused by the sweeper's
   `sweepCluster`/`sweepOrphans`).
 
+### Cobra/viper CLI command conventions
+
+CLI commands use `spf13/cobra` and `spf13/viper` as the rest of the project
+does — follow the existing patterns in `core/cmd/` and
+`core/kopia-pgbasebackup/cmd/`.
+
 ### `kopia-pgbasebackup` ingestion helper
 
 `core/kopia-pgbasebackup` is a separate, nested Go module (its own `go.mod` and
@@ -251,7 +257,8 @@ exists today; this is a guardrail for the future). Pick identity by use:
 binary. It imports Kopia under the canonical path `github.com/kopia/kopia` with a
 `replace` directive pointing at the `cloudnative-pg/kopia` fork (branch `klio`);
 drop the `replace` once the patches merge upstream. The design is in
-`documentation/design/basebackup-kopia-ingestion.md`.
+`documentation/design/basebackup-kopia-ingestion.md`. It follows the cobra/viper
+CLI conventions above (see `core/kopia-pgbasebackup/cmd/root.go`).
 
 Because Go does not descend into nested modules, `task core:lint` and
 `task core:go-test` do not cover it. CI does cover it through the dedicated
@@ -296,6 +303,20 @@ cached index, run tests, then revert.
   `Assisted-by: <tool name>` trailer (e.g. `Assisted-by: Claude`), separated
   from `Signed-off-by` by a blank line. `git commit -s` alone does not add
   this (write both trailers out explicitly).
+- Commit messages are checked by `task all:commitlint` (`commitlint.config.js`,
+  extends `@commitlint/config-conventional`); a failure blocks CI. Beyond
+  standard Conventional Commits, the rules that actually fail the build (as
+  opposed to warn) are:
+  - The body must start with a capital letter (`body-case: sentence-case`).
+    A body that opens with a lowercase code identifier (e.g.
+    `readEnvironment bulk-fetches...`) fails this rule — lead with a
+    capitalized word instead, e.g. `The readEnvironment function
+    bulk-fetches...`.
+  - The `Signed-off-by:` trailer is required (see above).
+  - Wrap body lines at 100 characters or fewer (warning only, but keep to it
+    anyway).
+  - Run `task all:commitlint` locally before pushing to catch this before CI
+    does.
 - Before committing, run:
   - `golangci-lint run` in `core/`
   - `golangci-lint run` in `operator/`

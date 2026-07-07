@@ -20,13 +20,67 @@ SPDX-License-Identifier: Apache-2.0
 package basebackupexec
 
 import (
+	"context"
+	"errors"
+	"io"
 	"testing"
 
+	"github.com/cloudnative-pg/machinery/pkg/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cloudnative-pg/klio/core/internal/client/klioclient"
+	kopiaconn "github.com/cloudnative-pg/klio/core/internal/client/klioclient/kopia"
+	kopiaWrapper "github.com/cloudnative-pg/klio/core/internal/kopia"
 )
+
+var _ BackupLister = (*kopiaconn.MultiConnection)(nil)
+
+// fakeProtocolUploader implements ProtocolUploader. Only GetBackupManifest and
+// ResolveManifestID are configurable; the rest are trivial stubs since the
+// tests here never call them.
+type fakeProtocolUploader struct {
+	manifest    []byte
+	manifestErr error
+
+	// resolveManifestID, when set, computes ResolveManifestID's result per
+	// call; otherwise it returns a fixed "resolved-id" for every call.
+	resolveManifestID func(tags map[string]string) (string, error)
+}
+
+func (f *fakeProtocolUploader) GetHostname() string { return "cluster-a" }
+
+func (f *fakeProtocolUploader) IngestBaseBackup(
+	context.Context, io.Reader, kopiaWrapper.IngestOptions,
+) (*kopiaWrapper.IngestResult, error) {
+	return nil, nil
+}
+
+func (f *fakeProtocolUploader) UploadBackupManifest(context.Context, string, string, []byte) error {
+	return nil
+}
+
+func (f *fakeProtocolUploader) UploadBackupMetadata(
+	context.Context, string, *klioclient.BackupMetadata,
+) error {
+	return nil
+}
+
+func (f *fakeProtocolUploader) SupportsBaseBackupIngestion() bool { return true }
+
+func (f *fakeProtocolUploader) GetBackupManifest(context.Context, string, string) ([]byte, error) {
+	return f.manifest, f.manifestErr
+}
+
+func (f *fakeProtocolUploader) ResolveManifestID(_ context.Context, tags map[string]string) (string, error) {
+	if f.resolveManifestID == nil {
+		return "resolved-id", nil
+	}
+
+	return f.resolveManifestID(tags)
+}
+
+var _ ProtocolUploader = (*fakeProtocolUploader)(nil)
 
 func TestSelectPriorBackup(t *testing.T) {
 	backups := klioclient.BackupList{
@@ -59,23 +113,6 @@ func TestSelectPriorBackup(t *testing.T) {
 		prior, err := SelectPriorBackup(backups, "missing")
 		require.ErrorIs(t, err, ErrPreviousBackupNotFound)
 		assert.Nil(t, prior)
-	})
-}
-
-func TestPickLatestBackup(t *testing.T) {
-	t.Run("empty list returns nil", func(t *testing.T) {
-		assert.Nil(t, pickLatestBackup(nil))
-	})
-
-	t.Run("picks the most recent by StartedAt", func(t *testing.T) {
-		backups := klioclient.BackupList{
-			{Name: "old", StartedAt: 100},
-			{Name: "newest", StartedAt: 300},
-			{Name: "middle", StartedAt: 200},
-		}
-		latest := pickLatestBackup(backups)
-		assert.NotNil(t, latest)
-		assert.Equal(t, "newest", latest.Name)
 	})
 }
 
@@ -127,19 +164,89 @@ func TestFindBackupByName(t *testing.T) {
 	})
 }
 
-func TestToMultiManifestMap(t *testing.T) {
-	t.Run("nil for empty input", func(t *testing.T) {
-		assert.Nil(t, ToMultiManifestMap(nil))
+func TestVerifyPriorPgdataExists(t *testing.T) {
+	t.Run("pgdata exists", func(t *testing.T) {
+		prior := &klioclient.BackupMetadata{Name: "backup-1"}
+		tier1 := &fakeProtocolUploader{}
+
+		reason, err := verifyPriorPgdataExists(context.Background(), tier1, prior)
+		require.NoError(t, err)
+		assert.Empty(t, reason)
 	})
 
-	t.Run("wraps each id in a single-element slice", func(t *testing.T) {
-		// Keys mirror the real combine-base keys: the constant "pgdata" for the
-		// main data directory (no leading slash) and /tablespace/<oid>.
-		out := ToMultiManifestMap(map[string]string{
-			"pgdata":          "m-pgdata",
-			"/tablespace/123": "m-ts",
-		})
-		assert.Equal(t, []string{"m-pgdata"}, out["pgdata"])
-		assert.Equal(t, []string{"m-ts"}, out["/tablespace/123"])
+	t.Run("a missing snapshot is a reason, not an error", func(t *testing.T) {
+		prior := &klioclient.BackupMetadata{Name: "backup-1"}
+		tier1 := &fakeProtocolUploader{
+			resolveManifestID: func(map[string]string) (string, error) {
+				return "", kopiaconn.NoSnapshotFoundError{}
+			},
+		}
+
+		reason, err := verifyPriorPgdataExists(context.Background(), tier1, prior)
+		require.NoError(t, err)
+		assert.NotEmpty(t, reason)
+	})
+
+	t.Run("a repository failure is returned as an error", func(t *testing.T) {
+		prior := &klioclient.BackupMetadata{Name: "backup-1"}
+		tier1 := &fakeProtocolUploader{
+			resolveManifestID: func(map[string]string) (string, error) {
+				return "", errors.New("connection reset")
+			},
+		}
+
+		reason, err := verifyPriorPgdataExists(context.Background(), tier1, prior)
+		require.Error(t, err)
+		assert.Empty(t, reason)
+	})
+}
+
+func TestLoadPriorManifest(t *testing.T) {
+	prior := &klioclient.BackupMetadata{Name: "backup-1"}
+
+	t.Run("manifest found", func(t *testing.T) {
+		tier1 := &fakeProtocolUploader{manifest: []byte("manifest-bytes")}
+
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		require.NoError(t, err)
+		assert.Empty(t, reason)
+		assert.Equal(t, []byte("manifest-bytes"), manifest)
+	})
+
+	t.Run("no stored manifest is a reason, not an error", func(t *testing.T) {
+		tier1 := &fakeProtocolUploader{manifestErr: kopiaconn.NoBackupFoundError{}}
+
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		require.NoError(t, err)
+		assert.Nil(t, manifest)
+		assert.Equal(t, "no stored backup_manifest", reason)
+	})
+
+	t.Run("a repository failure is returned as an error", func(t *testing.T) {
+		tier1 := &fakeProtocolUploader{manifestErr: errors.New("connection reset")}
+
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		require.Error(t, err)
+		assert.Empty(t, reason)
+		assert.Nil(t, manifest)
+	})
+}
+
+func TestPriorUnusable(t *testing.T) {
+	prior := &klioclient.BackupMetadata{Name: "backup-1"}
+	logger := log.FromContext(context.Background())
+
+	t.Run("an explicitly named backup is a hard error", func(t *testing.T) {
+		possible, err := priorUnusable(true, prior, "wrong cluster lineage", logger)
+		assert.False(t, possible)
+		require.ErrorIs(t, err, ErrPreviousBackupUnusable)
+		require.ErrorContains(t, err, "backup-1")
+		require.ErrorContains(t, err, "wrong cluster lineage")
+	})
+
+	t.Run("an auto-detected backup falls back to a full backup with a warning", func(t *testing.T) {
+		possible, err := priorUnusable(false, prior, "wrong cluster lineage", logger)
+		assert.False(t, possible)
+		require.NoError(t, err)
 	})
 }

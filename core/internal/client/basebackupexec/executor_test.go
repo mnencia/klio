@@ -39,6 +39,11 @@ import (
 // contract used by the executor.
 var _ Uploader = (*kopiaconn.Connection)(nil)
 
+// Compile-time assertion that the Kopia connection satisfies the
+// ProtocolUploader contract used by the BASE_BACKUP protocol CLI
+// orchestration in core/cmd/backup.
+var _ ProtocolUploader = (*kopiaconn.Connection)(nil)
+
 // fakeUploader records the ingest options it is called with, so tests can
 // assert the per-source decisions the executor makes.
 type fakeUploader struct {
@@ -73,7 +78,7 @@ func (f *fakeUploader) UploadBackupMetadata(
 // TestMakeHandlerFallsBackToFullForSourceWithoutPrior is the regression test for
 // a tablespace created after the previous backup. On an incremental backup such
 // a source has no combine base, so it must be ingested as a full source rather
-// than driving the helper with --incremental and no --previous-manifest (which
+// than driving the helper with --incremental and no --previous-backup-name (which
 // would fail the whole backup).
 func TestMakeHandlerFallsBackToFullForSourceWithoutPrior(t *testing.T) {
 	up := newFakeUploader()
@@ -85,30 +90,30 @@ func TestMakeHandlerFallsBackToFullForSourceWithoutPrior(t *testing.T) {
 	opts := Options{
 		Incremental: true,
 		// The main data directory has a prior; the new tablespace does not.
-		PreviousKopiaManifests: map[string][]string{mainDataSourceKey: {"m-pgdata"}},
+		PreviousBackup: &klioclient.BackupMetadata{Name: "backup-1"},
 	}
 
-	handler := e.makeHandler("backup-2", env, opts, map[string]string{})
+	handler := e.makeHandler("backup-2", env, opts)
 
 	// Main data directory: has a prior, so it is ingested incrementally.
 	require.NoError(t, handler(context.Background(), basebackup.DataSource{}, strings.NewReader("")))
 	main := up.ingestByPath["/pgdata"]
 	assert.True(t, main.Incremental, "main data dir must be incremental")
-	assert.Equal(t, []string{"m-pgdata"}, main.PreviousManifests)
+	assert.Equal(t, "backup-1", main.PreviousBackupName)
 
-	// A tablespace with no prior manifest: full ingest, no previous manifests.
+	// A tablespace with no prior manifest: full ingest, no previous backup name.
 	newTS := basebackup.DataSource{IsTablespace: true, TablespaceOID: "9999"}
 	require.NoError(t, handler(context.Background(), newTS, strings.NewReader("")))
 	ts := up.ingestByPath["/tablespace/9999"]
 	assert.False(t, ts.Incremental, "a source without a prior must be ingested as full")
-	assert.Empty(t, ts.PreviousManifests)
+	assert.Empty(t, ts.PreviousBackupName)
 }
 
 // TestMakeHandlerPerSourceIncrementalDecision exercises a single incremental
 // backup that spans several sources at once: the main data directory and two
 // tablespaces, only one of which existed in the prior backup. Each source's
-// incremental decision (and the manifests handed to the helper) must be resolved
-// independently from that source's own combine base.
+// incremental decision must be resolved independently from that source's own
+// combine base.
 func TestMakeHandlerPerSourceIncrementalDecision(t *testing.T) {
 	up := newFakeUploader()
 	e := &Executor{uploader: up, clusterName: up.hostname}
@@ -118,14 +123,16 @@ func TestMakeHandlerPerSourceIncrementalDecision(t *testing.T) {
 	}
 	opts := Options{
 		Incremental: true,
-		PreviousKopiaManifests: map[string][]string{
-			mainDataSourceKey:   {"m-pgdata"},
-			"/tablespace/16385": {"m-ts-old"},
-			// "/tablespace/9999" intentionally absent: created after the prior backup.
+		PreviousBackup: &klioclient.BackupMetadata{
+			Name: "backup-1",
+			Tablespaces: []klioclient.TablespaceLayout{
+				{Oid: "16385", Name: "ts_old"},
+				// "9999" intentionally absent: created after the prior backup.
+			},
 		},
 	}
 
-	handler := e.makeHandler("backup-2", env, opts, map[string]string{})
+	handler := e.makeHandler("backup-2", env, opts)
 
 	sources := []basebackup.DataSource{
 		{}, // main data directory
@@ -137,18 +144,18 @@ func TestMakeHandlerPerSourceIncrementalDecision(t *testing.T) {
 	}
 
 	cases := []struct {
-		path            string
-		wantIncremental bool
-		wantManifests   []string
+		path                   string
+		wantIncremental        bool
+		wantPreviousBackupName string
 	}{
-		{"/pgdata", true, []string{"m-pgdata"}},
-		{"/tablespace/16385", true, []string{"m-ts-old"}},
-		{"/tablespace/9999", false, nil},
+		{"/pgdata", true, "backup-1"},
+		{"/tablespace/16385", true, "backup-1"},
+		{"/tablespace/9999", false, ""},
 	}
 	for _, tc := range cases {
 		got := up.ingestByPath[tc.path]
 		assert.Equal(t, tc.wantIncremental, got.Incremental, "Incremental for %s", tc.path)
-		assert.Equal(t, tc.wantManifests, got.PreviousManifests, "PreviousManifests for %s", tc.path)
+		assert.Equal(t, tc.wantPreviousBackupName, got.PreviousBackupName, "PreviousBackupName for %s", tc.path)
 	}
 }
 
@@ -178,7 +185,8 @@ func TestSourceDescriptor(t *testing.T) {
 	}
 
 	t.Run("main data directory", func(t *testing.T) {
-		key, path, tags := sourceDescriptor(basebackup.DataSource{}, "backup-1", env)
+		key, path, tags, err := sourceDescriptor(basebackup.DataSource{}, "backup-1", env)
+		require.NoError(t, err)
 		assert.Equal(t, mainDataSourceKey, key)
 		assert.Equal(t, "/var/lib/postgresql/data/pgdata", path)
 		assert.Equal(t, "pgdata", tags[klioclient.BackupContentTagName])
@@ -187,8 +195,10 @@ func TestSourceDescriptor(t *testing.T) {
 
 	t.Run("main data directory key is stable across data_directory changes", func(t *testing.T) {
 		moved := &environment{pgData: "/srv/restored/pgdata"}
-		keyA, _, _ := sourceDescriptor(basebackup.DataSource{}, "backup-1", env)
-		keyB, pathB, _ := sourceDescriptor(basebackup.DataSource{}, "backup-2", moved)
+		keyA, _, _, errA := sourceDescriptor(basebackup.DataSource{}, "backup-1", env)
+		keyB, pathB, _, errB := sourceDescriptor(basebackup.DataSource{}, "backup-2", moved)
+		require.NoError(t, errA)
+		require.NoError(t, errB)
 		// The combine-base key must not move with the physical path, while the
 		// snapshot path tracks the physical data_directory.
 		assert.Equal(t, keyA, keyB)
@@ -197,11 +207,18 @@ func TestSourceDescriptor(t *testing.T) {
 
 	t.Run("tablespace", func(t *testing.T) {
 		src := basebackup.DataSource{IsTablespace: true, TablespaceOID: "16385", Location: "/srv/ts"}
-		key, path, tags := sourceDescriptor(src, "backup-1", env)
+		key, path, tags, err := sourceDescriptor(src, "backup-1", env)
+		require.NoError(t, err)
 		assert.Equal(t, "/tablespace/16385", key)
 		assert.Equal(t, "/tablespace/16385", path)
 		assert.Equal(t, "tablespace", tags[klioclient.BackupContentTagName])
 		assert.Equal(t, "ts_fast", tags[klioclient.TablespaceNameTagName])
+	})
+
+	t.Run("tablespace with an OID unknown to the environment errors", func(t *testing.T) {
+		src := basebackup.DataSource{IsTablespace: true, TablespaceOID: "99999", Location: "/srv/ghost"}
+		_, _, _, err := sourceDescriptor(src, "backup-1", env)
+		require.ErrorIs(t, err, ErrUnknownTablespace)
 	})
 }
 
@@ -226,7 +243,8 @@ func TestBuildMetadata(t *testing.T) {
 		Manifest: []byte("m"),
 	}
 
-	meta := e.buildMetadata("backup-1", started, env, result, false)
+	meta, err := e.buildMetadata("backup-1", started, env, result, false)
+	require.NoError(t, err)
 
 	assert.Equal(t, "backup-1", meta.Name)
 	assert.Equal(t, "cluster-a", meta.ClusterName)
@@ -251,14 +269,38 @@ func TestBuildMetadata(t *testing.T) {
 	assert.Equal(t, BackupMethodFull, meta.Annotations[BackupMethodAnnotationName])
 }
 
+// TestBuildMetadataUnknownTablespaceIsError is the regression test for a
+// tablespace created or renamed between readEnvironment's pg_tablespace query
+// and the BASE_BACKUP protocol's own, later tablespace list: an OID present
+// in result.Tablespaces but absent from env.tablespaceNames must fail loudly
+// instead of recording an empty tablespace name.
+func TestBuildMetadataUnknownTablespaceIsError(t *testing.T) {
+	e := &Executor{clusterName: "cluster-a"}
+	env := &environment{pgData: "/pgdata", tablespaceNames: map[string]string{}}
+	result := &basebackup.Result{
+		StartLSN: 0x2000028,
+		StartTLI: 1,
+		EndLSN:   0x3000000,
+		Tablespaces: []basebackup.Tablespace{
+			{OID: "", Location: ""},
+			{OID: "99999", Location: "/srv/ghost"},
+		},
+	}
+
+	_, err := e.buildMetadata("backup-1", time.Unix(1000, 0), env, result, false)
+	require.ErrorIs(t, err, ErrUnknownTablespace)
+}
+
 func TestBuildMetadataRecordsIncrementalMethod(t *testing.T) {
 	e := &Executor{clusterName: "cluster-a"}
 	env := &environment{pgData: "/pgdata", segmentSize: 16 * 1024 * 1024}
 	result := &basebackup.Result{StartLSN: 0x2000028, StartTLI: 1, EndLSN: 0x3000000}
 
-	full := e.buildMetadata("backup-full", time.Unix(1000, 0), env, result, false)
+	full, err := e.buildMetadata("backup-full", time.Unix(1000, 0), env, result, false)
+	require.NoError(t, err)
 	assert.Equal(t, BackupMethodFull, full.Annotations[BackupMethodAnnotationName])
 
-	incremental := e.buildMetadata("backup-incr", time.Unix(1000, 0), env, result, true)
+	incremental, err := e.buildMetadata("backup-incr", time.Unix(1000, 0), env, result, true)
+	require.NoError(t, err)
 	assert.Equal(t, BackupMethodIncremental, incremental.Annotations[BackupMethodAnnotationName])
 }
