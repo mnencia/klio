@@ -82,6 +82,16 @@ func (s *Connection) RestoreControlData(
 	return s.kopia.RestoreSnapshot(ctx, source, destinationPath)
 }
 
+// ResolveManifestID returns the current Kopia manifest ID for the snapshot
+// matching tags, resolved live rather than from a stored value. A snapshot's
+// manifest ID is not stable across pin/unpin: Kopia mints a fresh one
+// whenever a snapshot's pins change (for example the tier2-relay unpin in
+// internal/consumer/backup.go), so any caller needing a specific historical
+// snapshot must always resolve it by tag, the same way restore does here.
+func (s *Connection) ResolveManifestID(ctx context.Context, tags map[string]string) (string, error) {
+	return s.getSnapshotID(ctx, tags)
+}
+
 func (s *Connection) getSnapshotID(
 	ctx context.Context,
 	tags map[string]string,

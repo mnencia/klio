@@ -36,12 +36,16 @@ import (
 
 var _ BackupLister = (*kopiaconn.MultiConnection)(nil)
 
-// fakeProtocolUploader implements ProtocolUploader. Only GetBackupManifest is
-// configurable; the rest are trivial stubs since loadPriorManifest never
-// calls them.
+// fakeProtocolUploader implements ProtocolUploader. Only GetBackupManifest and
+// ResolveManifestID are configurable; the rest are trivial stubs since the
+// tests here never call them.
 type fakeProtocolUploader struct {
 	manifest    []byte
 	manifestErr error
+
+	// resolveManifestID, when set, computes ResolveManifestID's result per
+	// call; otherwise it returns a fixed "resolved-id" for every call.
+	resolveManifestID func(tags map[string]string) (string, error)
 }
 
 func (f *fakeProtocolUploader) GetHostname() string { return "cluster-a" }
@@ -66,6 +70,14 @@ func (f *fakeProtocolUploader) SupportsBaseBackupIngestion() bool { return true 
 
 func (f *fakeProtocolUploader) GetBackupManifest(context.Context, string, string) ([]byte, error) {
 	return f.manifest, f.manifestErr
+}
+
+func (f *fakeProtocolUploader) ResolveManifestID(_ context.Context, tags map[string]string) (string, error) {
+	if f.resolveManifestID == nil {
+		return "resolved-id", nil
+	}
+
+	return f.resolveManifestID(tags)
 }
 
 var _ ProtocolUploader = (*fakeProtocolUploader)(nil)
@@ -149,6 +161,43 @@ func TestFindBackupByName(t *testing.T) {
 
 	t.Run("nil for an empty list", func(t *testing.T) {
 		assert.Nil(t, findBackupByName(nil, "first"))
+	})
+}
+
+func TestVerifyPriorPgdataExists(t *testing.T) {
+	t.Run("pgdata exists", func(t *testing.T) {
+		prior := &klioclient.BackupMetadata{Name: "backup-1"}
+		tier1 := &fakeProtocolUploader{}
+
+		reason, err := verifyPriorPgdataExists(context.Background(), tier1, prior)
+		require.NoError(t, err)
+		assert.Empty(t, reason)
+	})
+
+	t.Run("a missing snapshot is a reason, not an error", func(t *testing.T) {
+		prior := &klioclient.BackupMetadata{Name: "backup-1"}
+		tier1 := &fakeProtocolUploader{
+			resolveManifestID: func(map[string]string) (string, error) {
+				return "", kopiaconn.NoSnapshotFoundError{}
+			},
+		}
+
+		reason, err := verifyPriorPgdataExists(context.Background(), tier1, prior)
+		require.NoError(t, err)
+		assert.NotEmpty(t, reason)
+	})
+
+	t.Run("a repository failure is returned as an error", func(t *testing.T) {
+		prior := &klioclient.BackupMetadata{Name: "backup-1"}
+		tier1 := &fakeProtocolUploader{
+			resolveManifestID: func(map[string]string) (string, error) {
+				return "", errors.New("connection reset")
+			},
+		}
+
+		reason, err := verifyPriorPgdataExists(context.Background(), tier1, prior)
+		require.Error(t, err)
+		assert.Empty(t, reason)
 	})
 }
 

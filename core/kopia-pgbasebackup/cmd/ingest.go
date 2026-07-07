@@ -29,7 +29,6 @@ import (
 	"sync/atomic"
 
 	"github.com/kopia/kopia/repo"
-	"github.com/kopia/kopia/repo/manifest"
 	"github.com/kopia/kopia/snapshot"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -37,10 +36,25 @@ import (
 	"github.com/cloudnative-pg/klio/core/kopia-pgbasebackup/internal/ingest"
 )
 
+// backupNameTag and contentTag must match klioclient.BackupNameTagName and
+// klioclient.BackupContentTagName in the core module. The two modules are
+// not code-shared (kopia-pgbasebackup is a separate Go module), but already
+// agree on every tag key passed via --tag today.
+const (
+	backupNameTag = "klio.io/tag"
+	contentTag    = "klio.io/content"
+)
+
+// tablespacePathPrefix is the synthetic SourceInfo.Path prefix core's
+// executor.go gives every tablespace source ("/tablespace/<oid>"), used
+// here to recognize a tablespace source without needing its own tag.
+const tablespacePathPrefix = "/tablespace/"
+
 var (
 	errInvalidTag                  = errors.New("invalid --tag, expected key=value")
-	errIncrementalRequiresPrevious = errors.New("--incremental requires --previous-manifest")
+	errIncrementalRequiresPrevious = errors.New("--incremental requires --previous-backup-name")
 	errEmptyRequiredFlag           = errors.New("required flag must not be empty")
+	errPriorSnapshotNotFound       = errors.New("prior snapshot not found")
 )
 
 // ingestCmd implements the "ingest" subcommand.
@@ -64,8 +78,8 @@ func init() {
 	ingestCmd.Flags().Int("block-size", ingest.DefaultBlockSize, "PostgreSQL BLCKSZ for incremental reconstruction")
 	ingestCmd.Flags().StringArray("tag", nil, "snapshot tag key=value (repeatable)")
 	ingestCmd.Flags().StringArray("pin", nil, "snapshot retention pin (repeatable)")
-	ingestCmd.Flags().String("previous-manifest", "",
-		"prior snapshot manifest ID for incremental combine")
+	ingestCmd.Flags().String("previous-backup-name", "",
+		"prior backup name for incremental combine")
 
 	for _, name := range []string{"config-file", "host", "username", "source-path"} {
 		_ = ingestCmd.MarkFlagRequired(name)
@@ -112,15 +126,16 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	blockSize, _ := cmd.Flags().GetInt("block-size")
 	tags, _ := cmd.Flags().GetStringArray("tag")
 	pins, _ := cmd.Flags().GetStringArray("pin")
-	prevManifest, _ := cmd.Flags().GetString("previous-manifest")
+	previousBackupName, _ := cmd.Flags().GetString("previous-backup-name")
 
 	tagMap, err := parseTags(tags)
 	if err != nil {
 		return err
 	}
 
+	source := snapshot.SourceInfo{Host: host, UserName: username, Path: sourcePath}
 	opts := ingest.Options{
-		Source:      snapshot.SourceInfo{Host: host, UserName: username, Path: sourcePath},
+		Source:      source,
 		Description: "pg_basebackup ingest of " + sourcePath,
 		Tags:        tagMap,
 		Pins:        pins,
@@ -134,7 +149,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	}
 	defer rep.Close(ctx) //nolint:errcheck
 
-	result, uploaded, err := ingestIntoRepo(ctx, rep, opts, incremental, prevManifest)
+	result, uploaded, err := ingestIntoRepo(ctx, rep, opts, source, incremental, previousBackupName, tagMap)
 	if err != nil {
 		return err
 	}
@@ -148,8 +163,10 @@ func ingestIntoRepo(
 	ctx context.Context,
 	rep repo.Repository,
 	opts ingest.Options,
+	source snapshot.SourceInfo,
 	incremental bool,
-	prevManifest string,
+	previousBackupName string,
+	tagMap map[string]string,
 ) (*ingest.Result, int64, error) {
 	var (
 		uploaded atomic.Int64
@@ -161,7 +178,7 @@ func ingestIntoRepo(
 		OnUpload: func(n int64) { uploaded.Add(n) },
 	}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		if incremental {
-			prior, priorErr := buildPriorImage(ctx, w, prevManifest)
+			prior, priorErr := buildPriorImage(ctx, w, source, previousBackupName, tagMap)
 			if priorErr != nil {
 				return priorErr
 			}
@@ -180,26 +197,59 @@ func ingestIntoRepo(
 	return result, uploaded.Load(), nil
 }
 
-// buildPriorImage loads the prior snapshot referenced by previous-manifest
-// and exposes its tree for incremental reconstruction. A single source is
-// always combined against exactly one prior snapshot (the depth-1
-// invariant), so the flag carries a single manifest ID.
+// buildPriorImage resolves the prior backup's snapshot for this same source
+// and exposes its tree for incremental reconstruction. Resolution and use
+// happen here, in the same call, immediately before the combine runs, so
+// there is no manifest ID handed across a process boundary for a later
+// pin/unpin to invalidate.
+//
+// The filter keys only on discriminators that are stable across backups:
+// content type, backup name, and — for a tablespace — its OID, carried in
+// the (stable) source path, never the mutable tablespace-name tag (ALTER
+// TABLESPACE ... RENAME changes the name but not the OID or path). pgdata's
+// own physical path is *not* stable across backups (for example after a
+// restore-in-place), so it is deliberately left out of scope instead.
 //
 //nolint:ireturn // returns the PriorImage abstraction by design
-func buildPriorImage(ctx context.Context, rep repo.Repository, prevManifest string) (ingest.PriorImage, error) {
-	if prevManifest == "" {
+func buildPriorImage(
+	ctx context.Context, rep repo.Repository, source snapshot.SourceInfo,
+	previousBackupName string, tagMap map[string]string,
+) (ingest.PriorImage, error) {
+	if previousBackupName == "" {
 		return nil, errIncrementalRequiresPrevious
 	}
 
-	prior, err := snapshot.LoadSnapshot(ctx, rep, manifest.ID(prevManifest))
-	if err != nil {
-		return nil, fmt.Errorf("while loading prior snapshot %q: %w", prevManifest, err)
-	}
-	if prior.RootEntry == nil {
-		return nil, fmt.Errorf("prior snapshot %q has no root entry", prevManifest)
+	filterTags := map[string]string{backupNameTag: previousBackupName}
+	if content, ok := tagMap[contentTag]; ok {
+		filterTags[contentTag] = content
 	}
 
-	return ingest.NewKopiaPriorImage(ctx, rep, prior.RootEntry.ObjectID), nil
+	scope := snapshot.SourceInfo{Host: source.Host, UserName: source.UserName}
+	if strings.HasPrefix(source.Path, tablespacePathPrefix) {
+		scope.Path = source.Path
+	}
+
+	// ListSnapshotManifests filters on raw manifest labels, not Options.Tags
+	// values directly — SaveSnapshot stores each tag under a "tag:"-prefixed
+	// label (see ingest.UserTagLabels), so the filter must use the same
+	// prefixed keys to match.
+	ids, err := snapshot.ListSnapshotManifests(ctx, rep, &scope, ingest.UserTagLabels(filterTags))
+	if err != nil {
+		return nil, fmt.Errorf("while finding prior snapshot %q: %w", previousBackupName, err)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("%w: %q", errPriorSnapshotNotFound, previousBackupName)
+	}
+
+	man, err := snapshot.LoadSnapshot(ctx, rep, ids[0])
+	if err != nil {
+		return nil, fmt.Errorf("while loading prior snapshot %q: %w", previousBackupName, err)
+	}
+	if man.RootEntry == nil {
+		return nil, fmt.Errorf("prior snapshot %q has no root entry", previousBackupName)
+	}
+
+	return ingest.NewKopiaPriorImage(ctx, rep, man.RootEntry.ObjectID), nil
 }
 
 func emitResult(result *ingest.Result, uploaded int64) error {

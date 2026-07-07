@@ -77,15 +77,6 @@ type BackupMetadata struct {
 	// Tablespaces are the metadata of the tablespaces
 	Tablespaces []TablespaceLayout `json:"tablespaces,omitempty"`
 
-	// KopiaManifests maps each backed-up source's stable combine-base key (the
-	// constant "pgdata" for the main data directory, or /tablespace/<oid>) to the
-	// Kopia snapshot manifest ID produced for it. The key is deliberately
-	// independent of the physical data_directory path so a later incremental can
-	// match its prior full image even if that path changed. Populated only on the
-	// BASE_BACKUP protocol path; used as the combine base for a subsequent
-	// incremental backup.
-	KopiaManifests map[string]string `json:"kopiaManifests,omitempty"`
-
 	// SelfContainedPgData is true when PGDATA was captured over the BASE_BACKUP
 	// protocol, so the restored tree already contains backup_label,
 	// tablespace_map and global/pg_control. On this path the restore must not

@@ -105,10 +105,12 @@ type BackupLister interface {
 }
 
 // ResolvePriorForIncremental tries to set up an incremental backup. It
-// selects a single prior backup and reads both the PostgreSQL backup_manifest
-// (for UPLOAD_MANIFEST) and that backup's per-source Kopia manifest IDs (the
-// combine base) from it, so the two halves always describe the same backup,
-// setting them on executorOpts. It returns true when incremental is possible.
+// selects a single prior backup, reads its stored PostgreSQL backup_manifest
+// (for UPLOAD_MANIFEST), and confirms its pgdata Kopia snapshot still exists,
+// setting the prior on executorOpts so the executor can identify each
+// source's combine base to kopia-pgbasebackup by backup name alone (see
+// executor.go's makeHandler — no Kopia-internal identifier is resolved or
+// stored here). It returns true when incremental is possible.
 //
 // The prior is chosen by previousBackupName when set, otherwise as the most
 // recent backup for the cluster. The distinction also governs what happens
@@ -154,13 +156,6 @@ func ResolvePriorForIncremental(
 		return priorUnusable(explicit, prior, reason, contextLogger)
 	}
 
-	// The combine base requires the prior backup's per-source Kopia snapshots,
-	// which only the BASE_BACKUP protocol path records. A prior produced by the
-	// filesystem-snapshot path cannot be used as an incremental base.
-	if len(prior.KopiaManifests) == 0 {
-		return unusable("no Kopia manifest references (not produced by the BASE_BACKUP protocol path)")
-	}
-
 	if reason := checkPriorLineage(ctx, sqlConn, prior, contextLogger); reason != "" {
 		return unusable(reason)
 	}
@@ -169,7 +164,7 @@ func ResolvePriorForIncremental(
 		return unusable(reason)
 	}
 
-	manifest, reason, err := loadPriorManifest(ctx, tier1, hostname, prior)
+	manifest, reason, err := resolveCombineBase(ctx, tier1, hostname, prior)
 	if err != nil {
 		return false, err
 	}
@@ -178,9 +173,32 @@ func ResolvePriorForIncremental(
 	}
 
 	executorOpts.PreviousManifest = manifest
-	executorOpts.PreviousKopiaManifests = prior.KopiaManifests
+	executorOpts.PreviousBackup = prior
 
 	return true, nil
+}
+
+// resolveCombineBase reads prior's stored PostgreSQL backup_manifest and
+// confirms its pgdata Kopia snapshot still exists. loadPriorManifest also
+// serves as the "was this produced by the BASE_BACKUP protocol path" gate:
+// only that path ever calls UploadBackupManifest, so a prior from the
+// filesystem-snapshot path has no stored backup_manifest and is rejected
+// here. A non-empty reason means prior is unusable; a nil error with an
+// empty reason means manifest is ready to use.
+func resolveCombineBase(
+	ctx context.Context, tier1 ProtocolUploader, hostname string, prior *klioclient.BackupMetadata,
+) ([]byte, string, error) {
+	manifest, reason, err := loadPriorManifest(ctx, tier1, hostname, prior)
+	if err != nil || reason != "" {
+		return nil, reason, err
+	}
+
+	reason, err = verifyPriorPgdataExists(ctx, tier1, prior)
+	if err != nil || reason != "" {
+		return nil, reason, err
+	}
+
+	return manifest, "", nil
 }
 
 // priorUnusable maps an "unusable prior" reason to the right outcome: a hard
@@ -272,6 +290,35 @@ func checkPriorWALSummaries(
 	}
 
 	return ""
+}
+
+// verifyPriorPgdataExists confirms prior's pgdata Kopia snapshot still
+// exists, as a go/no-go signal for attempting incremental at all: if
+// pgdata's own combine base is already gone, nothing meaningful would be
+// incremental anyway. This is a live, tag-based existence check (see
+// kopia.Connection.getSnapshotID) — the manifest ID it resolves is
+// discarded, never used as a combine base, since it is not stable across
+// pin/unpin (the actual combine base is resolved by kopia-pgbasebackup
+// itself, atomically, by backup name, immediately before use — see
+// executor.go's makeHandler). A non-empty reason means prior is unusable; a
+// nil error with an empty reason means pgdata's snapshot is confirmed
+// present.
+func verifyPriorPgdataExists(
+	ctx context.Context, tier1 ProtocolUploader, prior *klioclient.BackupMetadata,
+) (string, error) {
+	_, err := tier1.ResolveManifestID(ctx, map[string]string{
+		klioclient.BackupContentTagName: "pgdata",
+		klioclient.BackupNameTagName:    prior.Name,
+	})
+	if err != nil {
+		if _, ok := errors.AsType[kopiaconn.NoSnapshotFoundError](err); ok {
+			return "prior Kopia snapshot for pgdata no longer exists in the repository", nil
+		}
+
+		return "", fmt.Errorf("while verifying prior pgdata snapshot: %w", err)
+	}
+
+	return "", nil
 }
 
 // loadPriorManifest reads the stored backup_manifest for prior. A missing

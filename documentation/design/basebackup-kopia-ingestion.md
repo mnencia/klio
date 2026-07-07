@@ -146,7 +146,11 @@ kopia-pgbasebackup ingest \
   --tag key=value               # repeatable (content=pgdata|tablespace,
                                 #   backupName=...)
   [--pin <name>]                # tier2 retention pin (mirrors the current path)
-  [--previous-manifest=<id>]    # incremental only: the combine base
+  [--previous-backup-name=<name>]  # incremental only: the combine base's
+                                #   backup name; the helper resolves the
+                                #   actual snapshot itself, by tag, right
+                                #   before combining (see "Selecting the
+                                #   prior backup")
   [--incremental]               # incremental only: stdin is an incremental tar
   < <one tar stream on stdin>
 ```
@@ -363,22 +367,38 @@ that would break all three at once.
 
 ### Selecting the prior backup
 
-An incremental uses a single prior backup. From that backup it reads two things:
-the `backup_manifest` (sent with `UPLOAD_MANIFEST`) and the recorded per-source
-Kopia manifest IDs (the combine base). Both come from the same backup, so the
-deltas that PostgreSQL computes and the full image that Klio rebuilds against
-always describe the same point in time. By default the prior is the most recent
-backup; `--previous-backup-name` selects a specific one.
+An incremental uses a single prior backup. Klio reads the prior's stored
+`backup_manifest` (sent with `UPLOAD_MANIFEST`) and confirms its pgdata Kopia
+snapshot still exists, then identifies the prior to the helper **by backup
+name alone** — Klio's `klio backup run --previous-backup-name` flag and the
+helper's own `kopia-pgbasebackup ingest --previous-backup-name` flag (see
+"Helper interface" above) are distinct flags at different layers that happen
+to share a name, both ultimately carrying the same backup name. No Kopia
+manifest ID or object ID is ever resolved by Klio or stored across backups
+for this purpose: the helper resolves its own combine-base snapshot itself,
+by tag (content type, tablespace OID, backup name — never by the current
+backup's physical source path, which is not stable across backups), in the
+same call that uses it, immediately before the combine runs. This mirrors how
+restore already finds a backup's snapshot (by tag, live), and avoids a class
+of bug where a stored Kopia-internal identifier goes stale: Kopia reassigns a
+snapshot's manifest ID whenever its retention pins change (for example the
+tier2-relay unpin), so anything that resolved and cached such an ID earlier
+than the moment of use could resolve to a since-superseded, no-longer-existing
+ID.
+
+By default the prior is the most recent backup; `klio backup run
+--previous-backup-name` selects a specific one.
 
 For an automatically chosen prior, incremental is best-effort: Klio falls back
 to a full backup when it cannot use the prior. This happens when there is no
-previous backup, when the prior came from the filesystem path and has no Kopia
-manifest references, when the prior belongs to a different cluster lineage,
-when its stored manifest is missing, or when the WAL summaries covering it
-have been pruned past `wal_summary_keep_time`. When `--previous-backup-name`
-names a backup that does not exist or cannot serve as a base, that is an
-error: an explicit request cannot be honored silently. Repository errors are
-always errors.
+previous backup, when the prior came from the filesystem path and has no
+stored `backup_manifest` (only the BASE_BACKUP protocol path produces one),
+when the prior belongs to a different cluster lineage, when its pgdata Kopia
+snapshot no longer exists, or when the WAL summaries covering it have been
+pruned past `wal_summary_keep_time`. When `--previous-backup-name` names a
+backup that does not exist or cannot serve as a base, that is an error: an
+explicit request cannot be honored silently. Repository errors are always
+errors.
 
 A disabled `summarize_wal` is not part of this best-effort list: it fails the
 request unconditionally, before prior selection even runs, since no choice of
@@ -397,8 +417,9 @@ covering the backup is present.
 - The `backup_manifest` is stored as a single-file snapshot (`content=manifest`,
   tagged with the backup name), next to the metadata snapshot and pinned with
   it. Retention treats it like the metadata.
-- The per-source Kopia manifest IDs (the incremental combine base) are recorded
-  in the backup metadata (`KopiaManifests`).
+- No per-source Kopia identifier is recorded in the backup metadata. The
+  incremental combine base is identified by backup name only and resolved
+  live by the helper at combine time (see "Selecting the prior backup").
 
 The repository layout and the restore format do not change relative to the
 filesystem path.

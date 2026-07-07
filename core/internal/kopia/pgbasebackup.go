@@ -88,9 +88,12 @@ type IngestOptions struct {
 	// e.g. the tier2 pin).
 	Pins []string
 
-	// PreviousManifest holds the prior snapshot manifest ID used to combine an
-	// incremental backup into a full image.
-	PreviousManifest string
+	// PreviousBackupName is the prior backup's name, used to combine an
+	// incremental backup into a full image. No Kopia-internal identifier is
+	// passed here: the helper resolves its own combine-base snapshot by tag,
+	// atomically, immediately before use, so there is nothing for a later
+	// pin/unpin (which reassigns manifest IDs) to invalidate.
+	PreviousBackupName string
 
 	// Incremental marks the input tar as an incremental backup.
 	Incremental bool
@@ -140,8 +143,8 @@ func (c *PgBaseBackupClient) Ingest(
 		args = append(args, "--pin="+pin)
 	}
 
-	if opts.PreviousManifest != "" {
-		args = append(args, "--previous-manifest="+opts.PreviousManifest)
+	if opts.PreviousBackupName != "" {
+		args = append(args, "--previous-backup-name="+opts.PreviousBackupName)
 	}
 
 	if opts.Incremental {
@@ -163,7 +166,7 @@ func (c *PgBaseBackupClient) Ingest(
 		"incremental", opts.Incremental,
 		"tagCount", len(opts.Tags),
 		"pinCount", len(opts.Pins),
-		"hasPreviousManifest", opts.PreviousManifest != "")
+		"previousBackupName", opts.PreviousBackupName)
 
 	if err := RunWithLogCapture(ctx, cmd, &stdout); err != nil {
 		return nil, fmt.Errorf("while ingesting BASE_BACKUP source %q: %w", opts.SourcePath, err)

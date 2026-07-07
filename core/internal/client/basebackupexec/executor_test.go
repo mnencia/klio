@@ -78,7 +78,7 @@ func (f *fakeUploader) UploadBackupMetadata(
 // TestMakeHandlerFallsBackToFullForSourceWithoutPrior is the regression test for
 // a tablespace created after the previous backup. On an incremental backup such
 // a source has no combine base, so it must be ingested as a full source rather
-// than driving the helper with --incremental and no --previous-manifest (which
+// than driving the helper with --incremental and no --previous-backup-name (which
 // would fail the whole backup).
 func TestMakeHandlerFallsBackToFullForSourceWithoutPrior(t *testing.T) {
 	up := newFakeUploader()
@@ -90,30 +90,30 @@ func TestMakeHandlerFallsBackToFullForSourceWithoutPrior(t *testing.T) {
 	opts := Options{
 		Incremental: true,
 		// The main data directory has a prior; the new tablespace does not.
-		PreviousKopiaManifests: map[string]string{mainDataSourceKey: "m-pgdata"},
+		PreviousBackup: &klioclient.BackupMetadata{Name: "backup-1"},
 	}
 
-	handler := e.makeHandler("backup-2", env, opts, map[string]string{})
+	handler := e.makeHandler("backup-2", env, opts)
 
 	// Main data directory: has a prior, so it is ingested incrementally.
 	require.NoError(t, handler(context.Background(), basebackup.DataSource{}, strings.NewReader("")))
 	main := up.ingestByPath["/pgdata"]
 	assert.True(t, main.Incremental, "main data dir must be incremental")
-	assert.Equal(t, "m-pgdata", main.PreviousManifest)
+	assert.Equal(t, "backup-1", main.PreviousBackupName)
 
-	// A tablespace with no prior manifest: full ingest, no previous manifests.
+	// A tablespace with no prior manifest: full ingest, no previous backup name.
 	newTS := basebackup.DataSource{IsTablespace: true, TablespaceOID: "9999"}
 	require.NoError(t, handler(context.Background(), newTS, strings.NewReader("")))
 	ts := up.ingestByPath["/tablespace/9999"]
 	assert.False(t, ts.Incremental, "a source without a prior must be ingested as full")
-	assert.Empty(t, ts.PreviousManifest)
+	assert.Empty(t, ts.PreviousBackupName)
 }
 
 // TestMakeHandlerPerSourceIncrementalDecision exercises a single incremental
 // backup that spans several sources at once: the main data directory and two
 // tablespaces, only one of which existed in the prior backup. Each source's
-// incremental decision (and the manifests handed to the helper) must be resolved
-// independently from that source's own combine base.
+// incremental decision must be resolved independently from that source's own
+// combine base.
 func TestMakeHandlerPerSourceIncrementalDecision(t *testing.T) {
 	up := newFakeUploader()
 	e := &Executor{uploader: up, clusterName: up.hostname}
@@ -123,14 +123,16 @@ func TestMakeHandlerPerSourceIncrementalDecision(t *testing.T) {
 	}
 	opts := Options{
 		Incremental: true,
-		PreviousKopiaManifests: map[string]string{
-			mainDataSourceKey:   "m-pgdata",
-			"/tablespace/16385": "m-ts-old",
-			// "/tablespace/9999" intentionally absent: created after the prior backup.
+		PreviousBackup: &klioclient.BackupMetadata{
+			Name: "backup-1",
+			Tablespaces: []klioclient.TablespaceLayout{
+				{Oid: "16385", Name: "ts_old"},
+				// "9999" intentionally absent: created after the prior backup.
+			},
 		},
 	}
 
-	handler := e.makeHandler("backup-2", env, opts, map[string]string{})
+	handler := e.makeHandler("backup-2", env, opts)
 
 	sources := []basebackup.DataSource{
 		{}, // main data directory
@@ -142,18 +144,18 @@ func TestMakeHandlerPerSourceIncrementalDecision(t *testing.T) {
 	}
 
 	cases := []struct {
-		path            string
-		wantIncremental bool
-		wantManifest    string
+		path                   string
+		wantIncremental        bool
+		wantPreviousBackupName string
 	}{
-		{"/pgdata", true, "m-pgdata"},
-		{"/tablespace/16385", true, "m-ts-old"},
+		{"/pgdata", true, "backup-1"},
+		{"/tablespace/16385", true, "backup-1"},
 		{"/tablespace/9999", false, ""},
 	}
 	for _, tc := range cases {
 		got := up.ingestByPath[tc.path]
 		assert.Equal(t, tc.wantIncremental, got.Incremental, "Incremental for %s", tc.path)
-		assert.Equal(t, tc.wantManifest, got.PreviousManifest, "PreviousManifest for %s", tc.path)
+		assert.Equal(t, tc.wantPreviousBackupName, got.PreviousBackupName, "PreviousBackupName for %s", tc.path)
 	}
 }
 
