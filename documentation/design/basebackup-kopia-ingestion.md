@@ -368,8 +368,9 @@ that would break all three at once.
 ### Selecting the prior backup
 
 An incremental uses a single prior backup. Klio reads the prior's stored
-`backup_manifest` (sent with `UPLOAD_MANIFEST`) and confirms its pgdata Kopia
-snapshot still exists, then identifies the prior to the helper **by backup
+`backup_manifest` (sent with `UPLOAD_MANIFEST`) and confirms every Kopia
+snapshot the prior contributes as a combine base (its pgdata and each of its
+tablespaces) still exists, then identifies the prior to the helper **by backup
 name alone** — Klio's `klio backup run --previous-backup-name` flag and the
 helper's own `kopia-pgbasebackup ingest --previous-backup-name` flag (see
 "Helper interface" above) are distinct flags at different layers that happen
@@ -378,9 +379,12 @@ manifest ID or object ID is ever resolved by Klio or stored across backups
 for this purpose: the helper resolves its own combine-base snapshot itself,
 by tag (content type, tablespace OID, backup name — never by the current
 backup's physical source path, which is not stable across backups), in the
-same call that uses it, immediately before the combine runs. This mirrors how
-restore already finds a backup's snapshot (by tag, live), and avoids a class
-of bug where a stored Kopia-internal identifier goes stale: Kopia reassigns a
+same call that uses it, immediately before the combine runs. Those tags
+identify exactly one snapshot for a well-formed backup, so the helper treats
+a match of more than one (for example from a reused backup name) as an error
+rather than combining against an arbitrary one. This mirrors how restore
+already finds a backup's snapshot (by tag, live), and avoids a class of bug
+where a stored Kopia-internal identifier goes stale: Kopia reassigns a
 snapshot's manifest ID whenever its retention pins change (for example the
 tier2-relay unpin), so anything that resolved and cached such an ID earlier
 than the moment of use could resolve to a since-superseded, no-longer-existing
@@ -393,12 +397,16 @@ For an automatically chosen prior, incremental is best-effort: Klio falls back
 to a full backup when it cannot use the prior. This happens when there is no
 previous backup, when the prior came from the filesystem path and has no
 stored `backup_manifest` (only the BASE_BACKUP protocol path produces one),
-when the prior belongs to a different cluster lineage, when its pgdata Kopia
-snapshot no longer exists, or when the WAL summaries covering it have been
-pruned past `wal_summary_keep_time`. When `--previous-backup-name` names a
-backup that does not exist or cannot serve as a base, that is an error: an
-explicit request cannot be honored silently. Repository errors are always
-errors.
+when the prior belongs to a different cluster lineage, when any of its Kopia
+snapshots (pgdata or a tablespace) no longer exists, or when the WAL summaries
+covering it have been pruned past `wal_summary_keep_time`. Every combine base
+is checked up front because the prior `backup_manifest` is uploaded as a whole:
+PostgreSQL then streams every file it lists in incremental form with no
+per-source fallback once streaming starts, so a combine base that went missing
+would otherwise fail the whole backup mid-stream instead of degrading to a full
+one here. When `--previous-backup-name` names a backup that does not exist or
+cannot serve as a base, that is an error: an explicit request cannot be honored
+silently. Repository errors are always errors.
 
 A disabled `summarize_wal` is not part of this best-effort list: it fails the
 request unconditionally, before prior selection even runs, since no choice of
