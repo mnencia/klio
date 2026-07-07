@@ -90,7 +90,7 @@ type ProtocolUploader interface {
 
 	// GetBackupManifest retrieves a prior backup's persisted PostgreSQL
 	// backup_manifest, used as the UPLOAD_MANIFEST base for an incremental.
-	GetBackupManifest(ctx context.Context, hostname, backupName string) ([]byte, error)
+	GetBackupManifest(ctx context.Context, backupName string) ([]byte, error)
 
 	// ResolveManifestID confirms a snapshot matching tags currently exists,
 	// returning its Kopia manifest ID. Used only as a go/no-go existence

@@ -68,7 +68,7 @@ func (f *fakeProtocolUploader) UploadBackupMetadata(
 
 func (f *fakeProtocolUploader) SupportsBaseBackupIngestion() bool { return true }
 
-func (f *fakeProtocolUploader) GetBackupManifest(context.Context, string, string) ([]byte, error) {
+func (f *fakeProtocolUploader) GetBackupManifest(context.Context, string) ([]byte, error) {
 	return f.manifest, f.manifestErr
 }
 
@@ -207,7 +207,7 @@ func TestLoadPriorManifest(t *testing.T) {
 	t.Run("manifest found", func(t *testing.T) {
 		tier1 := &fakeProtocolUploader{manifest: []byte("manifest-bytes")}
 
-		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, prior)
 		require.NoError(t, err)
 		assert.Empty(t, reason)
 		assert.Equal(t, []byte("manifest-bytes"), manifest)
@@ -216,7 +216,7 @@ func TestLoadPriorManifest(t *testing.T) {
 	t.Run("no stored manifest is a reason, not an error", func(t *testing.T) {
 		tier1 := &fakeProtocolUploader{manifestErr: kopiaconn.NoBackupFoundError{}}
 
-		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, prior)
 		require.NoError(t, err)
 		assert.Nil(t, manifest)
 		assert.Equal(t, "no stored backup_manifest", reason)
@@ -225,7 +225,7 @@ func TestLoadPriorManifest(t *testing.T) {
 	t.Run("a repository failure is returned as an error", func(t *testing.T) {
 		tier1 := &fakeProtocolUploader{manifestErr: errors.New("connection reset")}
 
-		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, prior)
 		require.Error(t, err)
 		assert.Empty(t, reason)
 		assert.Nil(t, manifest)

@@ -76,10 +76,11 @@ func (s *Connection) IngestBaseBackup(
 }
 
 // GetBackupManifest retrieves the persisted PostgreSQL backup_manifest for the
-// named backup from the repository. It mirrors GetMetadata.
+// named backup from the repository. Like the RestorePgData family, it is scoped
+// to the connection's own hostname (see getSnapshotID).
 func (s *Connection) GetBackupManifest(
 	ctx context.Context,
-	hostname, backupName string,
+	backupName string,
 ) ([]byte, error) {
 	entryID, err := s.getSnapshotID(ctx, map[string]string{
 		klioclient.BackupNameTagName:    backupName,
@@ -87,7 +88,7 @@ func (s *Connection) GetBackupManifest(
 	})
 	if err != nil {
 		if _, ok := errors.AsType[NoSnapshotFoundError](err); ok {
-			return nil, newNoBackupFoundError(hostname, backupName)
+			return nil, newNoBackupFoundError(s.GetHostname(), backupName)
 		}
 
 		return nil, err

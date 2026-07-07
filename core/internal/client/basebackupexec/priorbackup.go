@@ -164,7 +164,7 @@ func ResolvePriorForIncremental(
 		return unusable(reason)
 	}
 
-	manifest, reason, err := resolveCombineBase(ctx, tier1, hostname, prior)
+	manifest, reason, err := resolveCombineBase(ctx, tier1, prior)
 	if err != nil {
 		return false, err
 	}
@@ -186,9 +186,9 @@ func ResolvePriorForIncremental(
 // here. A non-empty reason means prior is unusable; a nil error with an
 // empty reason means manifest is ready to use.
 func resolveCombineBase(
-	ctx context.Context, tier1 ProtocolUploader, hostname string, prior *klioclient.BackupMetadata,
+	ctx context.Context, tier1 ProtocolUploader, prior *klioclient.BackupMetadata,
 ) ([]byte, string, error) {
-	manifest, reason, err := loadPriorManifest(ctx, tier1, hostname, prior)
+	manifest, reason, err := loadPriorManifest(ctx, tier1, prior)
 	if err != nil || reason != "" {
 		return nil, reason, err
 	}
@@ -325,9 +325,9 @@ func verifyPriorPgdataExists(
 // manifest yields a non-empty "unusable" reason; a genuine repository failure is
 // returned as the error.
 func loadPriorManifest(
-	ctx context.Context, tier1 ProtocolUploader, hostname string, prior *klioclient.BackupMetadata,
+	ctx context.Context, tier1 ProtocolUploader, prior *klioclient.BackupMetadata,
 ) ([]byte, string, error) {
-	manifest, err := tier1.GetBackupManifest(ctx, hostname, prior.Name)
+	manifest, err := tier1.GetBackupManifest(ctx, prior.Name)
 	if err != nil {
 		if _, ok := errors.AsType[kopiaconn.NoBackupFoundError](err); ok {
 			return nil, "no stored backup_manifest", nil
