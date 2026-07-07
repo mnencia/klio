@@ -271,7 +271,7 @@ func sourceExistedInPrior(key string, prior *klioclient.BackupMetadata) bool {
 		return true
 	}
 	for _, tbl := range prior.Tablespaces {
-		if "/tablespace/"+tbl.Oid == key {
+		if tablespaceSourceKey(tbl.Oid) == key {
 			return true
 		}
 	}
@@ -284,6 +284,14 @@ func sourceExistedInPrior(key string, prior *klioclient.BackupMetadata) bool {
 // (e.g. after a restore-in-place), so a later incremental can always match its
 // prior full image.
 const mainDataSourceKey = "pgdata"
+
+// tablespaceSourceKey is the stable combine-base key (and Kopia SourceInfo.Path)
+// for a tablespace. Keyed on the OID, not the name or physical mount, so a
+// later incremental still matches its prior full image across a rename or a
+// relocation.
+func tablespaceSourceKey(oid string) string {
+	return "/tablespace/" + oid
+}
 
 // sourceDescriptor maps a protocol data source to a stable combine-base key, the
 // Kopia snapshot SourceInfo.Path, and the Kopia tags (in that return order). The
@@ -300,7 +308,7 @@ func sourceDescriptor(
 			return "", "", nil, err
 		}
 
-		key := "/tablespace/" + src.TablespaceOID
+		key := tablespaceSourceKey(src.TablespaceOID)
 
 		return key, key, map[string]string{
 			klioclient.BackupContentTagName:  "tablespace",
