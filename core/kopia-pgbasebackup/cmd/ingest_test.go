@@ -179,3 +179,25 @@ func TestBuildPriorImageResolvesRenamedTablespace(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("0123456789ABCDEF"), block)
 }
+
+// TestBuildPriorImageAmbiguousIsError confirms buildPriorImage fails loudly
+// rather than silently picking one snapshot when the filter tags match more
+// than one — for example a reused backup name — since combining against an
+// arbitrary combine base would corrupt the incremental.
+func TestBuildPriorImageAmbiguousIsError(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+
+	source := snapshot.SourceInfo{Host: "cluster-a", UserName: "streaming", Path: "/pgdata"}
+	tags := map[string]string{contentTag: "pgdata", backupNameTag: "backup-1"}
+	// Two snapshots under the same source and tags stand in for a reused --name.
+	ingestFull(ctx, t, configFile, source, tags)
+	ingestFull(ctx, t, configFile, source, tags)
+
+	rep, err := repo.Open(ctx, configFile, testPassword, &repo.Options{})
+	require.NoError(t, err)
+	defer rep.Close(ctx) //nolint:errcheck
+
+	_, err = buildPriorImage(ctx, rep, source, "backup-1", tags)
+	require.ErrorIs(t, err, errAmbiguousPriorSnapshot)
+}

@@ -68,7 +68,7 @@ func (f *fakeProtocolUploader) UploadBackupMetadata(
 
 func (f *fakeProtocolUploader) SupportsBaseBackupIngestion() bool { return true }
 
-func (f *fakeProtocolUploader) GetBackupManifest(context.Context, string, string) ([]byte, error) {
+func (f *fakeProtocolUploader) GetBackupManifest(context.Context, string) ([]byte, error) {
 	return f.manifest, f.manifestErr
 }
 
@@ -164,17 +164,23 @@ func TestFindBackupByName(t *testing.T) {
 	})
 }
 
-func TestVerifyPriorPgdataExists(t *testing.T) {
-	t.Run("pgdata exists", func(t *testing.T) {
-		prior := &klioclient.BackupMetadata{Name: "backup-1"}
+func TestVerifyPriorSnapshotsExist(t *testing.T) {
+	t.Run("pgdata and every tablespace exist", func(t *testing.T) {
+		prior := &klioclient.BackupMetadata{
+			Name: "backup-1",
+			Tablespaces: []klioclient.TablespaceLayout{
+				{Oid: "16385", Name: "ts1"},
+				{Oid: "16386", Name: "ts2"},
+			},
+		}
 		tier1 := &fakeProtocolUploader{}
 
-		reason, err := verifyPriorPgdataExists(context.Background(), tier1, prior)
+		reason, err := verifyPriorSnapshotsExist(context.Background(), tier1, prior)
 		require.NoError(t, err)
 		assert.Empty(t, reason)
 	})
 
-	t.Run("a missing snapshot is a reason, not an error", func(t *testing.T) {
+	t.Run("a missing pgdata snapshot is a reason, not an error", func(t *testing.T) {
 		prior := &klioclient.BackupMetadata{Name: "backup-1"}
 		tier1 := &fakeProtocolUploader{
 			resolveManifestID: func(map[string]string) (string, error) {
@@ -182,9 +188,29 @@ func TestVerifyPriorPgdataExists(t *testing.T) {
 			},
 		}
 
-		reason, err := verifyPriorPgdataExists(context.Background(), tier1, prior)
+		reason, err := verifyPriorSnapshotsExist(context.Background(), tier1, prior)
 		require.NoError(t, err)
 		assert.NotEmpty(t, reason)
+	})
+
+	t.Run("a missing tablespace snapshot is a reason, not an error", func(t *testing.T) {
+		prior := &klioclient.BackupMetadata{
+			Name:        "backup-1",
+			Tablespaces: []klioclient.TablespaceLayout{{Oid: "16385", Name: "ts1"}},
+		}
+		tier1 := &fakeProtocolUploader{
+			resolveManifestID: func(tags map[string]string) (string, error) {
+				if tags[klioclient.BackupContentTagName] == "tablespace" {
+					return "", kopiaconn.NoSnapshotFoundError{}
+				}
+
+				return "resolved-id", nil
+			},
+		}
+
+		reason, err := verifyPriorSnapshotsExist(context.Background(), tier1, prior)
+		require.NoError(t, err)
+		assert.Contains(t, reason, "ts1")
 	})
 
 	t.Run("a repository failure is returned as an error", func(t *testing.T) {
@@ -195,7 +221,7 @@ func TestVerifyPriorPgdataExists(t *testing.T) {
 			},
 		}
 
-		reason, err := verifyPriorPgdataExists(context.Background(), tier1, prior)
+		reason, err := verifyPriorSnapshotsExist(context.Background(), tier1, prior)
 		require.Error(t, err)
 		assert.Empty(t, reason)
 	})
@@ -207,7 +233,7 @@ func TestLoadPriorManifest(t *testing.T) {
 	t.Run("manifest found", func(t *testing.T) {
 		tier1 := &fakeProtocolUploader{manifest: []byte("manifest-bytes")}
 
-		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, prior)
 		require.NoError(t, err)
 		assert.Empty(t, reason)
 		assert.Equal(t, []byte("manifest-bytes"), manifest)
@@ -216,7 +242,7 @@ func TestLoadPriorManifest(t *testing.T) {
 	t.Run("no stored manifest is a reason, not an error", func(t *testing.T) {
 		tier1 := &fakeProtocolUploader{manifestErr: kopiaconn.NoBackupFoundError{}}
 
-		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, prior)
 		require.NoError(t, err)
 		assert.Nil(t, manifest)
 		assert.Equal(t, "no stored backup_manifest", reason)
@@ -225,7 +251,7 @@ func TestLoadPriorManifest(t *testing.T) {
 	t.Run("a repository failure is returned as an error", func(t *testing.T) {
 		tier1 := &fakeProtocolUploader{manifestErr: errors.New("connection reset")}
 
-		manifest, reason, err := loadPriorManifest(context.Background(), tier1, "cluster-a", prior)
+		manifest, reason, err := loadPriorManifest(context.Background(), tier1, prior)
 		require.Error(t, err)
 		assert.Empty(t, reason)
 		assert.Nil(t, manifest)

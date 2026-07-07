@@ -55,6 +55,7 @@ var (
 	errIncrementalRequiresPrevious = errors.New("--incremental requires --previous-backup-name")
 	errEmptyRequiredFlag           = errors.New("required flag must not be empty")
 	errPriorSnapshotNotFound       = errors.New("prior snapshot not found")
+	errAmbiguousPriorSnapshot      = errors.New("prior snapshot is ambiguous")
 )
 
 // ingestCmd implements the "ingest" subcommand.
@@ -236,6 +237,14 @@ func buildPriorImage(
 	}
 	if len(ids) == 0 {
 		return nil, fmt.Errorf("%w: %q", errPriorSnapshotNotFound, previousBackupName)
+	}
+	// A single klio backup writes exactly one snapshot per source, so more than
+	// one match means the tags no longer identify a unique combine base (for
+	// example a reused --name, or an incomplete snapshot left by an interrupted
+	// earlier attempt). Combining against an arbitrary one would silently
+	// corrupt the incremental, so fail loudly instead of guessing.
+	if len(ids) > 1 {
+		return nil, fmt.Errorf("%w: %q matches %d snapshots", errAmbiguousPriorSnapshot, previousBackupName, len(ids))
 	}
 
 	man, err := snapshot.LoadSnapshot(ctx, rep, ids[0])

@@ -398,6 +398,13 @@ func runViaBaseBackupProtocol(
 		possible, err := basebackupexec.ResolvePriorForIncremental(
 			ctx, kopiaClient, tier1, sqlConn, hostname, opts.previousBackupName, &executorOpts)
 		if err != nil {
+			// A disabled summarize_wal is a source-cluster misconfiguration, not a
+			// repository failure, so it carries the source exit code for accurate
+			// failure-category reporting.
+			if errors.Is(err, basebackupexec.ErrSummarizeWALDisabled) {
+				return nil, cli.NewCodedError(err, backupfailure.SourceError.ExitCode)
+			}
+
 			return nil, cli.NewCodedError(err, backupfailure.RepositoryError.ExitCode)
 		}
 		// Incremental is a best-effort optimization: when no usable prior backup
