@@ -27,6 +27,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"sync/atomic"
 
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/object"
@@ -69,11 +70,24 @@ type KopiaPriorImage struct {
 	// manifest - a backup already selected because it still exists and is
 	// retained.
 	dirCache map[object.ID]*snapshot.DirManifest
+
+	// bytesRead accumulates the block bytes read from prior file objects during
+	// reconstruction, so callers can report how much unchanged data the combine
+	// had to pull back from the repository (zero for files taken via the
+	// metadata-only reuse path).
+	bytesRead atomic.Int64
 }
 
 // NewKopiaPriorImage builds a prior image rooted at the given directory object.
 func NewKopiaPriorImage(ctx context.Context, rep repo.Repository, rootOID object.ID) *KopiaPriorImage {
 	return &KopiaPriorImage{ctx: ctx, rep: rep, rootOID: rootOID, dirCache: map[object.ID]*snapshot.DirManifest{}}
+}
+
+// BytesRead reports the total block bytes read from the prior image's file
+// objects during reconstruction. A file taken via the metadata-only reuse path
+// contributes nothing, so this is the read-back the reuse optimization avoids.
+func (p *KopiaPriorImage) BytesRead() int64 {
+	return p.bytesRead.Load()
 }
 
 // BlockReader implements PriorImage.
@@ -90,7 +104,9 @@ func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlock
 		return nil, fmt.Errorf("while opening prior object for %q: %w", relPath, err)
 	}
 
-	return &objectBlockReader{reader: reader, blockSize: blockSize, buf: make([]byte, blockSize)}, nil
+	return &objectBlockReader{
+		reader: reader, blockSize: blockSize, buf: make([]byte, blockSize), bytesRead: &p.bytesRead,
+	}, nil
 }
 
 // Entry implements PriorImage: it returns the prior snapshot's file entry for
@@ -192,6 +208,10 @@ type objectBlockReader struct {
 	// objectBlockReader is only ever driven synchronously from a single
 	// Reconstruct call for one file.
 	buf []byte
+
+	// bytesRead points at the owning KopiaPriorImage's counter, bumped by the
+	// block size on each successful read so the total read-back is observable.
+	bytesRead *atomic.Int64
 }
 
 // Close releases the underlying Kopia object reader.
@@ -208,6 +228,7 @@ func (o *objectBlockReader) ReadBlock(n uint32) ([]byte, error) {
 	if _, err := io.ReadFull(o.reader, o.buf); err != nil {
 		return nil, fmt.Errorf("while reading prior block %d: %w", n, err)
 	}
+	o.bytesRead.Add(int64(o.blockSize))
 
 	return o.buf, nil
 }

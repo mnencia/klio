@@ -99,6 +99,13 @@ type outputStats struct {
 	HashedBytes int64 `json:"hashedBytes"`
 	CachedBytes int64 `json:"cachedBytes"`
 	FileCount   int64 `json:"fileCount"`
+
+	// ReusedFiles is the number of unchanged files that referenced the prior
+	// object directly, and PriorReadBytes the block bytes read back from the
+	// prior image to reconstruct the rest. Together they show how much of an
+	// incremental's read-back the reuse fast path avoided.
+	ReusedFiles    int64 `json:"reusedFiles"`
+	PriorReadBytes int64 `json:"priorReadBytes"`
 }
 
 func runIngest(cmd *cobra.Command, _ []string) error {
@@ -150,16 +157,19 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	}
 	defer rep.Close(ctx) //nolint:errcheck
 
-	result, uploaded, err := ingestIntoRepo(ctx, rep, opts, source, incremental, previousBackupName, tagMap)
+	result, uploaded, priorReadBytes, err := ingestIntoRepo(
+		ctx, rep, opts, source, incremental, previousBackupName, tagMap)
 	if err != nil {
 		return err
 	}
 
-	return emitResult(result, uploaded)
+	return emitResult(result, uploaded, priorReadBytes)
 }
 
-// ingestIntoRepo runs the ingest inside a write session, returning the result
-// and the number of bytes actually uploaded (for the dedup statistics).
+// ingestIntoRepo runs the ingest inside a write session, returning the result,
+// the number of bytes actually uploaded (for the dedup statistics), and the
+// bytes read back from the prior image during incremental reconstruction (zero
+// for a full backup or for unchanged files taken via the reuse fast path).
 func ingestIntoRepo(
 	ctx context.Context,
 	rep repo.Repository,
@@ -168,18 +178,21 @@ func ingestIntoRepo(
 	incremental bool,
 	previousBackupName string,
 	tagMap map[string]string,
-) (*ingest.Result, int64, error) {
+) (*ingest.Result, int64, int64, error) {
 	var (
-		uploaded atomic.Int64
-		result   *ingest.Result
+		uploaded       atomic.Int64
+		result         *ingest.Result
+		priorReadBytes int64
 	)
 
 	writeErr := repo.WriteSession(ctx, rep, repo.WriteSessionOptions{
 		Purpose:  "kopia-pgbasebackup",
 		OnUpload: func(n int64) { uploaded.Add(n) },
 	}, func(ctx context.Context, w repo.RepositoryWriter) error {
+		var prior *ingest.KopiaPriorImage
 		if incremental {
-			prior, priorErr := buildPriorImage(ctx, w, source, previousBackupName, tagMap)
+			var priorErr error
+			prior, priorErr = buildPriorImage(ctx, w, source, previousBackupName, tagMap)
 			if priorErr != nil {
 				return priorErr
 			}
@@ -188,14 +201,17 @@ func ingestIntoRepo(
 
 		var runErr error
 		result, runErr = ingest.Run(ctx, w, os.Stdin, opts)
+		if prior != nil {
+			priorReadBytes = prior.BytesRead()
+		}
 
 		return runErr
 	})
 	if writeErr != nil {
-		return nil, 0, fmt.Errorf("while ingesting BASE_BACKUP: %w", writeErr)
+		return nil, 0, 0, fmt.Errorf("while ingesting BASE_BACKUP: %w", writeErr)
 	}
 
-	return result, uploaded.Load(), nil
+	return result, uploaded.Load(), priorReadBytes, nil
 }
 
 // buildPriorImage resolves the prior backup's snapshot for this same source
@@ -210,12 +226,10 @@ func ingestIntoRepo(
 // TABLESPACE ... RENAME changes the name but not the OID or path). pgdata's
 // own physical path is *not* stable across backups (for example after a
 // restore-in-place), so it is deliberately left out of scope instead.
-//
-//nolint:ireturn // returns the PriorImage abstraction by design
 func buildPriorImage(
 	ctx context.Context, rep repo.Repository, source snapshot.SourceInfo,
 	previousBackupName string, tagMap map[string]string,
-) (ingest.PriorImage, error) {
+) (*ingest.KopiaPriorImage, error) {
 	if previousBackupName == "" {
 		return nil, errIncrementalRequiresPrevious
 	}
@@ -261,7 +275,7 @@ func buildPriorImage(
 	return ingest.NewKopiaPriorImage(ctx, rep, man.RootEntry.ObjectID), nil
 }
 
-func emitResult(result *ingest.Result, uploaded int64) error {
+func emitResult(result *ingest.Result, uploaded, priorReadBytes int64) error {
 	// These byte counts are an approximation, not an exact accounting. uploaded
 	// is the number of bytes written to the blob store (post-compression,
 	// post-dedup), reported as hashedBytes; TotalSize is the logical size of the
@@ -275,10 +289,12 @@ func emitResult(result *ingest.Result, uploaded int64) error {
 		ManifestID:   result.ManifestID,
 		RootObjectID: result.RootObjectID,
 		Stats: outputStats{
-			TotalSize:   result.Stats.TotalSize,
-			HashedBytes: uploaded,
-			CachedBytes: cached,
-			FileCount:   result.Stats.FileCount,
+			TotalSize:      result.Stats.TotalSize,
+			HashedBytes:    uploaded,
+			CachedBytes:    cached,
+			FileCount:      result.Stats.FileCount,
+			ReusedFiles:    result.Stats.ReusedFiles,
+			PriorReadBytes: priorReadBytes,
 		},
 	}
 

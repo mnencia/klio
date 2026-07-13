@@ -76,6 +76,10 @@ type Options struct {
 type Stats struct {
 	TotalSize int64
 	FileCount int64
+
+	// ReusedFiles is the number of unchanged files that referenced the prior
+	// object directly instead of reading its blocks back to rebuild it.
+	ReusedFiles int64
 }
 
 // Result is the outcome of an ingest, serialized to stdout by the CLI.
@@ -514,6 +518,7 @@ func (a *assembler) addIncrementalFile(
 		// prefix of the prior, so it falls through to reconstruct that prefix.
 		if prior.FileSize == int64(header.TruncationBlockLength)*int64(a.opts.BlockSize) {
 			a.stats.FileCount++
+			a.stats.ReusedFiles++
 			a.stats.TotalSize += prior.FileSize
 
 			return a.fileEntry(hdr, relPath, prior.ObjectID, prior.FileSize), relPath, nil
