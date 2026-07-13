@@ -444,3 +444,250 @@ func assertFileEqual(t *testing.T, path string, want []byte) {
 		t.Fatalf("file %q: got %d bytes, want %d bytes (content differs)", path, len(got), len(want))
 	}
 }
+
+// recordingPrior wraps a PriorImage and records the relPaths passed to
+// BlockReader, so a test can assert the metadata-only fast path read no blocks.
+type recordingPrior struct {
+	inner            PriorImage
+	blockReaderPaths []string
+}
+
+//nolint:ireturn // mirrors the wrapped PriorImage signature
+func (r *recordingPrior) BlockReader(relPath string, blockSize int) (PriorBlockReader, error) {
+	r.blockReaderPaths = append(r.blockReaderPaths, relPath)
+
+	return r.inner.BlockReader(relPath, blockSize)
+}
+
+func (r *recordingPrior) Entry(relPath string) (*snapshot.DirEntry, error) {
+	return r.inner.Entry(relPath)
+}
+
+// fileObjectID resolves the object ID of the file at relPath in a snapshot.
+func fileObjectID(ctx context.Context, t *testing.T, configFile, manifestID, relPath string) string {
+	t.Helper()
+	rep, err := repo.Open(ctx, configFile, testPassword, &repo.Options{})
+	if err != nil {
+		t.Fatalf("open repo: %v", err)
+	}
+	defer rep.Close(ctx) //nolint:errcheck
+
+	man, err := snapshot.LoadSnapshot(ctx, rep, manifest.ID(manifestID))
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	entry, err := NewKopiaPriorImage(ctx, rep, man.RootEntry.ObjectID).Entry(relPath)
+	if err != nil {
+		t.Fatalf("resolve %q: %v", relPath, err)
+	}
+
+	return entry.ObjectID.String()
+}
+
+// TestIncrementalUnchangedFileReusesPriorObject takes a full backup, then
+// ingests an incremental in which the relation is unchanged (a zero-block
+// INCREMENTAL member). The combined snapshot must reuse the prior object
+// directly: no prior blocks are read, the restore is byte-faithful, and the new
+// file's object ID equals the prior's.
+func TestIncrementalUnchangedFileReusesPriorObject(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+	modTime := time.Unix(1_700_000_000, 0)
+
+	// Full backup: a 4-block relation segment.
+	fullRelation := bytes.Join([][]byte{
+		priorBlock(0), priorBlock(1), priorBlock(2), priorBlock(3),
+	}, nil)
+	fullTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/1259", typeflag: tar.TypeReg, mode: 0o600, data: fullRelation, modTime: modTime},
+	})
+	full := ingestTar(ctx, t, configFile, fullTar,
+		Options{Source: defaultSource(), BlockSize: testBlockSize}, nil)
+
+	// Incremental where the relation is unchanged: a zero-block incremental with
+	// the same 4-block length.
+	incMember := buildIncrementalFile(t, 4, nil)
+	incTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/INCREMENTAL.1259", typeflag: tar.TypeReg, mode: 0o600, data: incMember, modTime: modTime},
+	})
+
+	var rec *recordingPrior
+	inc := ingestTar(ctx, t, configFile, incTar,
+		Options{Source: defaultSource(), Incremental: true, BlockSize: testBlockSize},
+		func(w repo.RepositoryWriter, opts *Options) {
+			priorMan, err := snapshot.LoadSnapshot(ctx, w, manifest.ID(full.ManifestID))
+			if err != nil {
+				t.Fatalf("load prior snapshot: %v", err)
+			}
+			rec = &recordingPrior{inner: NewKopiaPriorImage(ctx, w, priorMan.RootEntry.ObjectID)}
+			opts.Prior = rec
+		})
+
+	// The metadata-only fast path must not read any prior blocks.
+	if len(rec.blockReaderPaths) != 0 {
+		t.Fatalf("expected no prior block reads for an unchanged file, got %v", rec.blockReaderPaths)
+	}
+
+	// Restore reproduces the original content.
+	out := filepath.Join(t.TempDir(), "restored-unchanged")
+	restoreSnapshot(ctx, t, configFile, inc.ManifestID, out)
+	assertFileEqual(t, filepath.Join(out, "base/1/1259"), fullRelation)
+
+	// The new file references the very same object as the prior backup.
+	if prior, got := fileObjectID(ctx, t, configFile, full.ManifestID, "base/1/1259"),
+		fileObjectID(ctx, t, configFile, inc.ManifestID, "base/1/1259"); prior != got {
+		t.Fatalf("object id not reused: prior %s, new %s", prior, got)
+	}
+}
+
+// ingestTarErr runs an ingest and returns the run error (nil on success) instead
+// of failing the test, for adversarial cases that must be rejected.
+func ingestTarErr(
+	ctx context.Context, t *testing.T, configFile string, tarBytes []byte, opts Options,
+	configurePrior func(w repo.RepositoryWriter, opts *Options),
+) error {
+	t.Helper()
+
+	rep, err := repo.Open(ctx, configFile, testPassword, &repo.Options{})
+	if err != nil {
+		t.Fatalf("open repo: %v", err)
+	}
+	defer rep.Close(ctx) //nolint:errcheck
+
+	return repo.WriteSession(ctx, rep, repo.WriteSessionOptions{Purpose: "test"},
+		func(ctx context.Context, w repo.RepositoryWriter) error {
+			if configurePrior != nil {
+				configurePrior(w, &opts)
+			}
+			_, runErr := Run(ctx, w, bytes.NewReader(tarBytes), opts)
+
+			return runErr
+		})
+}
+
+// fullThenIncremental ingests a 4-block full backup of base/1/1259, then returns
+// a closure that configures an incremental's prior image against it and the full
+// backup's result, so the adversarial tests below share the setup.
+func fullThenIncremental(
+	ctx context.Context, t *testing.T, configFile string, modTime time.Time,
+) (*Result, func(w repo.RepositoryWriter, opts *Options)) {
+	t.Helper()
+
+	fullRelation := bytes.Join([][]byte{
+		priorBlock(0), priorBlock(1), priorBlock(2), priorBlock(3),
+	}, nil)
+	fullTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/1259", typeflag: tar.TypeReg, mode: 0o600, data: fullRelation, modTime: modTime},
+	})
+	full := ingestTar(ctx, t, configFile, fullTar,
+		Options{Source: defaultSource(), BlockSize: testBlockSize}, nil)
+
+	configurePrior := func(w repo.RepositoryWriter, opts *Options) {
+		priorMan, err := snapshot.LoadSnapshot(ctx, w, manifest.ID(full.ManifestID))
+		if err != nil {
+			t.Fatalf("load prior snapshot: %v", err)
+		}
+		opts.Prior = NewKopiaPriorImage(ctx, w, priorMan.RootEntry.ObjectID)
+	}
+
+	return full, configurePrior
+}
+
+// TestIncrementalShrunkFileFallsBackToReconstruct guards against reusing the
+// prior object when the relation shrank. A zero-block incremental with a shorter
+// truncation is a prefix of the prior, not the whole prior object, so it must
+// reconstruct (reading prior blocks) rather than take the metadata-only fast
+// path, which would restore too many blocks.
+func TestIncrementalShrunkFileFallsBackToReconstruct(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+	modTime := time.Unix(1_700_000_000, 0)
+
+	full, _ := fullThenIncremental(ctx, t, configFile, modTime)
+
+	// Relation shrank to 2 blocks, nothing changed: zero-block, truncation 2.
+	shrunk := buildIncrementalFile(t, 2, nil)
+	incTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/INCREMENTAL.1259", typeflag: tar.TypeReg, mode: 0o600, data: shrunk, modTime: modTime},
+	})
+
+	var rec *recordingPrior
+	inc := ingestTar(ctx, t, configFile, incTar,
+		Options{Source: defaultSource(), Incremental: true, BlockSize: testBlockSize},
+		func(w repo.RepositoryWriter, opts *Options) {
+			priorMan, err := snapshot.LoadSnapshot(ctx, w, manifest.ID(full.ManifestID))
+			if err != nil {
+				t.Fatalf("load prior snapshot: %v", err)
+			}
+			rec = &recordingPrior{inner: NewKopiaPriorImage(ctx, w, priorMan.RootEntry.ObjectID)}
+			opts.Prior = rec
+		})
+
+	if len(rec.blockReaderPaths) == 0 {
+		t.Fatal("shrunk file wrongly took the reuse fast path; expected block reads to reconstruct the prefix")
+	}
+
+	out := filepath.Join(t.TempDir(), "restored-shrunk")
+	restoreSnapshot(ctx, t, configFile, inc.ManifestID, out)
+	assertFileEqual(t, filepath.Join(out, "base/1/1259"), bytes.Join([][]byte{priorBlock(0), priorBlock(1)}, nil))
+}
+
+// TestIncrementalZeroBlockRejectsTrailingData ensures the metadata-only fast
+// path keeps the integrity check the reconstruct path has: a header-only
+// zero-block member with trailing bytes is malformed and must be rejected, even
+// though its length would otherwise match the prior (so reuse would fire).
+func TestIncrementalZeroBlockRejectsTrailingData(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+	modTime := time.Unix(1_700_000_000, 0)
+
+	_, configurePrior := fullThenIncremental(ctx, t, configFile, modTime)
+
+	// Unchanged length (truncation 4 == prior), but a stray trailing byte.
+	bad := append(buildIncrementalFile(t, 4, nil), 0x00)
+	incTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/INCREMENTAL.1259", typeflag: tar.TypeReg, mode: 0o600, data: bad, modTime: modTime},
+	})
+
+	err := ingestTarErr(ctx, t, configFile, incTar,
+		Options{Source: defaultSource(), Incremental: true, BlockSize: testBlockSize}, configurePrior)
+	if !errors.Is(err, ErrIncrementalTrailingData) {
+		t.Fatalf("trailing data: got %v, want ErrIncrementalTrailingData", err)
+	}
+}
+
+// TestIncrementalReuseErrorsWhenPriorFileMissing ensures a missing combine base
+// fails loudly rather than corrupting: an incremental for a file absent from the
+// prior (for example pruned by retention) must error, not silently produce an
+// empty or wrong file.
+func TestIncrementalReuseErrorsWhenPriorFileMissing(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+	modTime := time.Unix(1_700_000_000, 0)
+
+	_, configurePrior := fullThenIncremental(ctx, t, configFile, modTime)
+
+	// The prior has base/1/1259, not base/1/9999.
+	member := buildIncrementalFile(t, 2, nil)
+	incTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/INCREMENTAL.9999", typeflag: tar.TypeReg, mode: 0o600, data: member, modTime: modTime},
+	})
+
+	err := ingestTarErr(ctx, t, configFile, incTar,
+		Options{Source: defaultSource(), Incremental: true, BlockSize: testBlockSize}, configurePrior)
+	if !errors.Is(err, ErrPriorEntryNotFound) {
+		t.Fatalf("missing prior file: got %v, want ErrPriorEntryNotFound", err)
+	}
+}

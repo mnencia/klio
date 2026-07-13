@@ -163,11 +163,15 @@ with status zero:
   "manifestId": "...",
   "rootObjectId": "...",
   "stats": { "totalSize": 0, "hashedBytes": 0, "cachedBytes": 0,
-             "fileCount": 0 }
+             "fileCount": 0, "reusedFiles": 0, "priorReadBytes": 0 }
 }
 ```
 
-`hashedBytes` versus `cachedBytes` shows whether deduplication is effective.
+`hashedBytes` versus `cachedBytes` shows whether upload deduplication is
+effective. `reusedFiles` and `priorReadBytes` cover the read side of an
+incremental: how many unchanged files were referenced from the prior object
+directly (the fast path above), and how many block bytes were read back from the
+prior image to rebuild the rest. Klio logs both when it runs the helper.
 Progress and logs go to standard error, read line by line (this includes the
 disk-full detection). On failure the exit status is non-zero, and Klio attaches
 the last lines of standard error to the error it reports, so the real cause is
@@ -296,8 +300,10 @@ block numbers. The header is padded up to a multiple of `BLCKSZ` (PostgreSQL's
 block size, normally 8 KB). The data of the present blocks follows, in array
 order. Two cases matter:
 
-- an unchanged file is sent as a zero-block incremental (header only), so it is
-  rebuilt entirely from the prior backup;
+- an unchanged file is sent as a zero-block incremental (header only); the
+  helper reuses the prior backup's object for it directly, without reading its
+  blocks back (see combine-on-ingest), or rebuilds the surviving prefix of a
+  truncated file from the prior;
 - some files arrive in full even in an incremental backup: a file whose size is
   not a multiple of `BLCKSZ`, a free space map (FSM) fork, a new file, or a file
   where more than 90% of the blocks changed. The helper tells incremental and
@@ -329,6 +335,19 @@ walk of `i`, and the prior reads are at increasing offsets. Identical rebuilt
 blocks deduplicate against the prior on their own. So the new repository storage
 is roughly the changed blocks, while PostgreSQL only read and shipped the
 changed blocks.
+
+A file with no present blocks whose length still matches the prior takes a
+metadata-only fast path: rebuilding it would read every block back only to
+produce an object byte-identical to the prior, so the helper references the
+prior object directly instead. No blocks are read, and nothing is hashed again.
+Block-level reconstruction plus deduplication would converge on that same
+object, so the reference graph (and the depth-1 invariant below) is unchanged;
+the fast path only avoids the read-back. In a typical incremental the unchanged
+files are the bulk of the data, so this avoids most of the repository reads a
+rebuild would otherwise incur. A file that shrank (a shorter truncation) is a
+genuine prefix of the prior and still goes through the rebuild above. The helper
+reports how many files it reused and how many prior bytes it read back (see the
+`reusedFiles` and `priorReadBytes` stats).
 
 The rebuild is strict. It checks that every present block is consumed and that
 the incremental stream ends exactly where expected. It also resolves the prior

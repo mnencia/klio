@@ -102,6 +102,13 @@ type IngestStats struct {
 	HashedBytes int64 `json:"hashedBytes"`
 	CachedBytes int64 `json:"cachedBytes"`
 	FileCount   int64 `json:"fileCount"`
+
+	// ReusedFiles is the number of unchanged files an incremental referenced
+	// from the prior object directly, and PriorReadBytes the block bytes read
+	// back from the prior image to reconstruct the rest. Together they show how
+	// much read-back the incremental reuse fast path avoided.
+	ReusedFiles    int64 `json:"reusedFiles"`
+	PriorReadBytes int64 `json:"priorReadBytes"`
 }
 
 // IngestResult is the single JSON object the helper prints on stdout when an
@@ -167,6 +174,16 @@ func (c *PgBaseBackupClient) Ingest(
 	if err != nil {
 		return nil, fmt.Errorf("while parsing kopia-pgbasebackup output for source %q: %w", opts.SourcePath, err)
 	}
+
+	contextLogger.Info("Ingested BASE_BACKUP source into Kopia",
+		"sourcePath", opts.SourcePath,
+		"incremental", opts.Incremental,
+		"totalSize", result.Stats.TotalSize,
+		"hashedBytes", result.Stats.HashedBytes,
+		"cachedBytes", result.Stats.CachedBytes,
+		"fileCount", result.Stats.FileCount,
+		"reusedFiles", result.Stats.ReusedFiles,
+		"priorReadBytes", result.Stats.PriorReadBytes)
 
 	return result, nil
 }

@@ -73,6 +73,10 @@ type Options struct {
 type Stats struct {
 	TotalSize int64
 	FileCount int64
+
+	// ReusedFiles is the number of unchanged files that referenced the prior
+	// object directly instead of reading its blocks back to rebuild it.
+	ReusedFiles int64
 }
 
 // Result is the outcome of an ingest, serialized to stdout by the CLI.
@@ -88,6 +92,11 @@ type PriorImage interface {
 	// BlockReader returns a reader for the prior image of the relation segment
 	// at relPath (the INCREMENTAL. prefix already stripped).
 	BlockReader(relPath string, blockSize int) (PriorBlockReader, error)
+
+	// Entry returns the prior snapshot's file entry for relPath (its ObjectID
+	// and size), so an unchanged file can reference the prior object directly
+	// instead of reading and rehashing every block to rebuild an identical one.
+	Entry(relPath string) (*snapshot.DirEntry, error)
 }
 
 // dirNode is one directory in the tree being assembled. Directories are kept in
@@ -353,31 +362,18 @@ func (a *assembler) writeDir(node *dirNode) (*snapshot.DirEntry, error) {
 	}, nil
 }
 
-// fileContent resolves the content reader and logical path for a tar file
-// member. On an incremental backup it reconstructs an INCREMENTAL.* member
-// against the prior image (stripping the INCREMENTAL. prefix from the path) and
-// strips the INCREMENTAL FROM lines from backup_label. The returned finish
-// reconciles the io.Copy error with any background work tied to the reader (for
-// example incremental reconstruction); it is a no-op for plain members.
+// fileContent resolves the content reader and logical path for a plain tar file
+// member. On an incremental backup it strips the INCREMENTAL FROM lines from
+// backup_label so the combined tree is a self-contained full backup. The
+// returned finish is a no-op here; INCREMENTAL.* members are handled separately
+// by addIncrementalFile. The finish signature is kept so writeFile can serve
+// both paths.
 func (a *assembler) fileContent(
 	tr *tar.Reader, name string,
 ) (io.Reader, string, func(error) error, error) {
 	noop := func(copyErr error) error { return copyErr }
-	base := path.Base(name)
 
-	switch {
-	case a.opts.Incremental && strings.HasPrefix(base, IncrementalFilePrefix):
-		reconstructed, relPath, rErr := a.reconstructIncremental(tr, name)
-		if rErr != nil {
-			return nil, "", nil, rErr
-		}
-
-		return reconstructed, relPath, reconstructed.finish, nil
-
-	case a.opts.Incremental && base == backupLabelFile:
-		// An incremental backup_label carries INCREMENTAL FROM lines. Strip them
-		// so the combined snapshot is a self-contained full backup that
-		// PostgreSQL will start without pg_combinebackup.
+	if a.opts.Incremental && path.Base(name) == backupLabelFile {
 		raw, rErr := io.ReadAll(tr)
 		if rErr != nil {
 			return nil, "", nil, fmt.Errorf("while reading %q: %w", name, rErr)
@@ -390,15 +386,28 @@ func (a *assembler) fileContent(
 }
 
 // addFile streams a regular file into the repository and returns its DirEntry
-// and the logical path it belongs at. INCREMENTAL.* members are reconstructed
+// and the logical path it belongs at. INCREMENTAL.* members are combined
 // against the prior image when running an incremental backup; the returned path
 // has the INCREMENTAL. prefix stripped.
 func (a *assembler) addFile(tr *tar.Reader, hdr *tar.Header, name string) (*snapshot.DirEntry, string, error) {
+	if a.opts.Incremental && strings.HasPrefix(path.Base(name), IncrementalFilePrefix) {
+		return a.addIncrementalFile(tr, hdr, name)
+	}
+
 	content, logical, finish, err := a.fileContent(tr, name)
 	if err != nil {
 		return nil, "", err
 	}
 
+	return a.writeFile(hdr, logical, content, finish)
+}
+
+// writeFile streams content into a new repository object and returns the file's
+// DirEntry. finish reconciles the io.Copy error with any background producer
+// (incremental reconstruction); for plain members it is a no-op.
+func (a *assembler) writeFile(
+	hdr *tar.Header, logical string, content io.Reader, finish func(error) error,
+) (*snapshot.DirEntry, string, error) {
 	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "FILE:" + logical})
 	defer writer.Close() //nolint:errcheck
 
@@ -415,16 +424,22 @@ func (a *assembler) addFile(tr *tar.Reader, hdr *tar.Header, name string) (*snap
 	a.stats.FileCount++
 	a.stats.TotalSize += written
 
+	return a.fileEntry(hdr, logical, oid, written), logical, nil
+}
+
+// fileEntry builds a file DirEntry from the tar header metadata plus a resolved
+// object ID and size (freshly written, or reused from the prior image).
+func (a *assembler) fileEntry(hdr *tar.Header, logical string, oid object.ID, size int64) *snapshot.DirEntry {
 	return &snapshot.DirEntry{
 		Name:        path.Base(logical),
 		Type:        snapshot.EntryTypeFile,
 		Permissions: snapshot.Permissions(hdr.FileInfo().Mode() & fs.ModBits),
-		FileSize:    written,
+		FileSize:    size,
 		ModTime:     fs.UTCTimestampFromTime(hdr.ModTime),
 		UserID:      uint32(hdr.Uid), //nolint:gosec // unix uid fits uint32
 		GroupID:     uint32(hdr.Gid), //nolint:gosec // unix gid fits uint32
 		ObjectID:    oid,
-	}, logical, nil
+	}
 }
 
 // reconstructReader streams the reconstructed full image produced by a
@@ -455,21 +470,55 @@ func (r *reconstructReader) finish(copyErr error) error {
 	return recErr
 }
 
-// reconstructIncremental returns a reader that yields the full image of an
-// INCREMENTAL.* member combined against the prior backup, and the member's
-// logical relation path (with the INCREMENTAL. prefix stripped).
-func (a *assembler) reconstructIncremental(tr *tar.Reader, name string) (*reconstructReader, string, error) {
-	dir := path.Dir(name)
-	base := strings.TrimPrefix(path.Base(name), IncrementalFilePrefix)
-	relPath := path.Join(dir, base)
+// addIncrementalFile combines an INCREMENTAL.* member against the prior image
+// and returns the resulting file DirEntry and its logical path (INCREMENTAL.
+// prefix stripped). A file with no changed blocks whose length still matches
+// the prior reuses the prior object directly (metadata only, no block reads);
+// otherwise the full image is reconstructed block by block and written.
+func (a *assembler) addIncrementalFile(
+	tr *tar.Reader, hdr *tar.Header, name string,
+) (*snapshot.DirEntry, string, error) {
+	relPath := path.Join(path.Dir(name), strings.TrimPrefix(path.Base(name), IncrementalFilePrefix))
 
 	header, err := ParseIncrementalHeader(tr, a.opts.BlockSize)
 	if err != nil {
 		return nil, "", fmt.Errorf("while parsing incremental header for %q: %w", name, err)
 	}
-
 	if a.opts.Prior == nil {
 		return nil, "", fmt.Errorf("incremental member %q but no prior image configured", name)
+	}
+
+	// Metadata-only fast path: with no changed blocks the rebuilt file would be
+	// byte-identical to the prior object, so reference that object directly
+	// instead of reading every block back to rebuild and re-hash an identical
+	// file. Block-level reconstruction plus Kopia dedup converges on the same
+	// object; this skips the read-back and rehash. A file that shrank
+	// (truncation shorter than the prior) falls through to reconstruct its
+	// prefix, which is a genuinely different object.
+	if len(header.BlockNumbers) == 0 {
+		// A zero-block incremental is header-only. Reject trailing data before
+		// trusting it, the same integrity check reconstruction applies via
+		// assertDrained (the fast path never reaches Reconstruct). A well-formed
+		// member is already at EOF here, so this consumes nothing.
+		if err := assertDrained(tr, make([]byte, 1)); err != nil {
+			return nil, "", fmt.Errorf("while combining %q: %w", name, err)
+		}
+
+		prior, err := a.opts.Prior.Entry(relPath)
+		if err != nil {
+			return nil, "", fmt.Errorf("while resolving prior entry for %q: %w", relPath, err)
+		}
+
+		// Reuse the prior object only when the file is unchanged in full (its
+		// length still matches). A shrunk file (shorter truncation) is a genuine
+		// prefix of the prior, so it falls through to reconstruct that prefix.
+		if prior.FileSize == int64(header.TruncationBlockLength)*int64(a.opts.BlockSize) {
+			a.stats.FileCount++
+			a.stats.ReusedFiles++
+			a.stats.TotalSize += prior.FileSize
+
+			return a.fileEntry(hdr, relPath, prior.ObjectID, prior.FileSize), relPath, nil
+		}
 	}
 
 	prior, err := a.opts.Prior.BlockReader(relPath, a.opts.BlockSize)
@@ -477,16 +526,26 @@ func (a *assembler) reconstructIncremental(tr *tar.Reader, name string) (*recons
 		return nil, "", fmt.Errorf("while opening prior image of %q: %w", relPath, err)
 	}
 
+	reader := startReconstruct(header, tr, prior)
+
+	return a.writeFile(hdr, relPath, reader, reader.finish)
+}
+
+// startReconstruct spawns the reconstruction of an incremental member against
+// its prior image and returns a reader streaming the rebuilt full image. The
+// caller must call the reader's finish exactly once to release the goroutine
+// (and the prior image) and to learn the real error.
+func startReconstruct(header *IncrementalHeader, blockData io.Reader, prior PriorBlockReader) *reconstructReader {
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
 		defer prior.Close() //nolint:errcheck
-		err := Reconstruct(header, tr, prior, pw)
+		err := Reconstruct(header, blockData, prior, pw)
 		pw.CloseWithError(err)
 		done <- err
 	}()
 
-	return &reconstructReader{pr: pr, done: done}, relPath, nil
+	return &reconstructReader{pr: pr, done: done}
 }
 
 // addSymlink stores a symbolic link, writing its target as the object content
