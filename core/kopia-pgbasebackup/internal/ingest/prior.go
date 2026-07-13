@@ -80,12 +80,12 @@ func NewKopiaPriorImage(ctx context.Context, rep repo.Repository, rootOID object
 //
 //nolint:ireturn // returns the PriorBlockReader abstraction by design
 func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlockReader, error) {
-	oid, err := p.resolve(relPath)
+	entry, err := p.resolveEntry(relPath)
 	if err != nil {
 		return nil, err
 	}
 
-	reader, err := p.rep.OpenObject(p.ctx, oid)
+	reader, err := p.rep.OpenObject(p.ctx, entry.ObjectID)
 	if err != nil {
 		return nil, fmt.Errorf("while opening prior object for %q: %w", relPath, err)
 	}
@@ -93,11 +93,18 @@ func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlock
 	return &objectBlockReader{reader: reader, blockSize: blockSize, buf: make([]byte, blockSize)}, nil
 }
 
-// resolve walks the directory tree to find the object ID for relPath. Every
-// intermediate component must be a directory and the final component a regular
-// file; otherwise resolution fails rather than reading a non-file object (a
-// symlink target or a directory manifest) as relation block data.
-func (p *KopiaPriorImage) resolve(relPath string) (object.ID, error) {
+// Entry implements PriorImage: it returns the prior snapshot's file entry for
+// relPath (its ObjectID and size), so an unchanged file can reference the prior
+// object directly without reading its blocks.
+func (p *KopiaPriorImage) Entry(relPath string) (*snapshot.DirEntry, error) {
+	return p.resolveEntry(relPath)
+}
+
+// resolveEntry walks the directory tree to find the file entry for relPath.
+// Every intermediate component must be a directory and the final component a
+// regular file; otherwise resolution fails rather than reading a non-file
+// object (a symlink target or a directory manifest) as relation block data.
+func (p *KopiaPriorImage) resolveEntry(relPath string) (*snapshot.DirEntry, error) {
 	current := p.rootOID
 	clean := path.Clean(strings.TrimPrefix(relPath, "./"))
 
@@ -109,18 +116,19 @@ func (p *KopiaPriorImage) resolve(relPath string) (object.ID, error) {
 		parts = append(parts, part)
 	}
 	if len(parts) == 0 {
-		return object.EmptyID, fmt.Errorf("%w: %q resolves to the tree root", ErrPriorEntryNotFound, relPath)
+		return nil, fmt.Errorf("%w: %q resolves to the tree root", ErrPriorEntryNotFound, relPath)
 	}
 
+	var entry *snapshot.DirEntry
 	for i, part := range parts {
 		manifest, err := p.readDirManifest(current)
 		if err != nil {
-			return object.EmptyID, err
+			return nil, err
 		}
 
-		entry := findEntry(manifest, part)
+		entry = findEntry(manifest, part)
 		if entry == nil {
-			return object.EmptyID, fmt.Errorf("%w: %q (at %q)", ErrPriorEntryNotFound, relPath, part)
+			return nil, fmt.Errorf("%w: %q (at %q)", ErrPriorEntryNotFound, relPath, part)
 		}
 
 		want := snapshot.EntryTypeDirectory
@@ -128,14 +136,14 @@ func (p *KopiaPriorImage) resolve(relPath string) (object.ID, error) {
 			want = snapshot.EntryTypeFile
 		}
 		if entry.Type != want {
-			return object.EmptyID, fmt.Errorf("%w: %q (at %q) is %q, want %q",
+			return nil, fmt.Errorf("%w: %q (at %q) is %q, want %q",
 				ErrPriorEntryWrongType, relPath, part, entry.Type, want)
 		}
 
 		current = entry.ObjectID
 	}
 
-	return current, nil
+	return entry, nil
 }
 
 // readDirManifest decodes a directory object into its DirManifest, caching the
