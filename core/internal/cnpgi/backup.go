@@ -116,6 +116,11 @@ func (b backupServiceImplementation) Backup(
 		attribute.String("backup.role", role),
 	)
 
+	protocolOverrides, err := parseProtocolOverrides(request.GetParameters())
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse backup parameters: %w", err)
+	}
+
 	backupStart := time.Now()
 	recordBackupStart(ctx)
 	defer recordBackupFinished(ctx)
@@ -124,6 +129,7 @@ func (b backupServiceImplementation) Backup(
 		ctx,
 		backupName,
 		isPrimary,
+		protocolOverrides,
 	)
 	if err != nil {
 		recordBackupFailure(ctx, time.Since(backupStart), err)
@@ -164,6 +170,43 @@ func (b backupServiceImplementation) Backup(
 	}, nil
 }
 
+// protocolOverrides carries per-Backup overrides of the Klio configuration's
+// backup.use_base_backup_protocol and backup.incremental settings, sourced
+// from the CNPG Backup CR's spec.pluginConfiguration.parameters. A nil field
+// means the CR did not set an override, so the Klio configuration default
+// (and any CLI flag) applies unchanged.
+type protocolOverrides struct {
+	useBaseBackupProtocol *bool
+	incremental           *bool
+}
+
+// parseProtocolOverrides extracts the useBaseBackupProtocol and incremental
+// overrides from the Backup CR parameters. An unset key leaves the
+// corresponding field nil; a key present with a value that is not a valid
+// bool is a fatal error, since silently ignoring it could run a backup with
+// an unintended protocol.
+func parseProtocolOverrides(params map[string]string) (protocolOverrides, error) {
+	var overrides protocolOverrides
+
+	if v, ok := params["useBaseBackupProtocol"]; ok {
+		parsed, err := strconv.ParseBool(v)
+		if err != nil {
+			return protocolOverrides{}, fmt.Errorf("invalid useBaseBackupProtocol parameter %q: %w", v, err)
+		}
+		overrides.useBaseBackupProtocol = &parsed
+	}
+
+	if v, ok := params["incremental"]; ok {
+		parsed, err := strconv.ParseBool(v)
+		if err != nil {
+			return protocolOverrides{}, fmt.Errorf("invalid incremental parameter %q: %w", v, err)
+		}
+		overrides.incremental = &parsed
+	}
+
+	return overrides, nil
+}
+
 // classifyRunBackupError maps an error from the `klio backup run`
 // subprocess to a failure category. A category reported by the
 // subprocess via its exit code takes precedence over the context error.
@@ -190,6 +233,7 @@ func (b backupServiceImplementation) runBackup(
 	ctx context.Context,
 	backupName string,
 	isPrimary bool,
+	protocolOverrides protocolOverrides,
 ) (*klioclient.BackupMetadata, error) {
 	ctx, span := tracer.Start(ctx, opentelemetry.BackupRunSpan)
 	defer span.End()
@@ -213,6 +257,13 @@ func (b backupServiceImplementation) runBackup(
 
 	if b.Tier2 {
 		args = append(args, "--enable-tier2-backup")
+	}
+
+	if protocolOverrides.useBaseBackupProtocol != nil {
+		args = append(args, fmt.Sprintf("--use-base-backup-protocol=%t", *protocolOverrides.useBaseBackupProtocol))
+	}
+	if protocolOverrides.incremental != nil {
+		args = append(args, fmt.Sprintf("--incremental=%t", *protocolOverrides.incremental))
 	}
 
 	contextLogger.Info("Starting Klio backup", "backupName", backupName, "args", args)
