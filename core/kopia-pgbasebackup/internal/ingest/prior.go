@@ -83,6 +83,12 @@ type KopiaPriorImage struct {
 	// number of blocks the backup manufactured rather than sourced - normally a
 	// small, steady number (e.g. pg_statistic churn); a spike is worth a look.
 	zeroFilledBlocks atomic.Int64
+
+	// priorSegments maps a file's logical path to its ordered segment object IDs
+	// from the prior backup, so an incremental can reference an unchanged
+	// segment by object ID instead of reading its blocks back. Nil when the
+	// prior backup recorded no segment map.
+	priorSegments map[string][]object.ID
 }
 
 // NewKopiaPriorImage builds a prior image rooted at the given directory object.
@@ -129,6 +135,24 @@ func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlock
 // object directly without reading its blocks.
 func (p *KopiaPriorImage) Entry(relPath string) (*snapshot.DirEntry, error) {
 	return p.resolveEntry(relPath)
+}
+
+// SetSegments installs the prior backup's per-file segment object IDs so an
+// incremental can reference an unchanged segment by object ID.
+func (p *KopiaPriorImage) SetSegments(segments map[string][]object.ID) {
+	p.priorSegments = segments
+}
+
+// Segments implements PriorImage: it returns the prior backup's ordered segment
+// object IDs for relPath, or ok=false when the prior recorded no segment map.
+func (p *KopiaPriorImage) Segments(relPath string) ([]object.ID, bool) {
+	if p.priorSegments == nil {
+		return nil, false
+	}
+	clean := path.Clean(strings.TrimPrefix(relPath, "./"))
+	segs, ok := p.priorSegments[clean]
+
+	return segs, ok
 }
 
 // resolveEntry walks the directory tree to find the file entry for relPath.
@@ -218,10 +242,10 @@ type objectBlockReader struct {
 	blockSize int
 
 	// buf is reused across ReadBlock calls instead of allocating a fresh
-	// blockSize buffer each time. Safe: the caller (Reconstruct) writes out
+	// blockSize buffer each time. Safe: the caller (rebuildSegment) writes out
 	// each returned block immediately and never retains it, and one
 	// objectBlockReader is only ever driven synchronously from a single
-	// Reconstruct call for one file.
+	// combine for one file.
 	buf []byte
 
 	// bytesRead points at the owning KopiaPriorImage's counter, bumped by the

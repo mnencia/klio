@@ -26,7 +26,6 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"time"
 )
 
 // testBlockSize is a small BLCKSZ to keep fixtures readable.
@@ -146,129 +145,19 @@ func TestParseIncrementalHeaderRejectsBlockBeyondTruncation(t *testing.T) {
 	}
 }
 
-func TestReconstructRejectsTrailingData(t *testing.T) {
-	// Hand-build a file whose header claims one block but whose data section
-	// carries two: reconstruction must not silently discard the extra block.
-	var buf bytes.Buffer
-	w32 := func(v uint32) {
-		var b [4]byte
-		binary.LittleEndian.PutUint32(b[:], v)
-		buf.Write(b[:])
-	}
-	w32(incrementalMagic)
-	w32(1) // nblocks claimed
-	w32(3) // truncation
-	w32(0) // present block 0
-	for buf.Len()%testBlockSize != 0 {
-		buf.WriteByte(0)
-	}
-	buf.Write(presentBlock(0))
-	buf.Write(presentBlock(1)) // undeclared trailing block
-
-	r := bytes.NewReader(buf.Bytes())
-	h, err := ParseIncrementalHeader(r, testBlockSize)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-
-	prior := mapPrior{blocks: map[uint32][]byte{1: priorBlock(1), 2: priorBlock(2)}}
-	err = Reconstruct(h, r, prior, &bytes.Buffer{})
-	if !errors.Is(err, ErrIncrementalTrailingData) {
-		t.Fatalf("expected ErrIncrementalTrailingData, got %v", err)
-	}
-}
-
-func TestReconstructMixesIncrementalAndPrior(t *testing.T) {
-	// truncation 5, blocks 1 and 3 changed; 0,2,4 come from prior.
-	data := buildIncrementalFile(t, 5, []uint32{1, 3})
-	r := bytes.NewReader(data)
-	h, err := ParseIncrementalHeader(r, testBlockSize)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-
-	prior := mapPrior{blocks: map[uint32][]byte{
-		0: priorBlock(0),
-		2: priorBlock(2),
-		4: priorBlock(4),
-	}}
-
+func TestWritePriorOrZeroBlockZeroFillsBeyondPrior(t *testing.T) {
+	// A block the prior image does not hold (io.EOF) is an uninitialized
+	// extension block below truncation: writePriorOrZeroBlock must zero-fill it,
+	// matching pg_combinebackup, rather than failing. This is the shared helper
+	// the live rebuildSegment path uses; full-file reconstruction correctness is
+	// covered by TestIncrementalSegmentReference and the chain test.
+	prior := mapPrior{blocks: map[uint32][]byte{1: priorBlock(1)}} // block 2 absent -> EOF
 	var out bytes.Buffer
-	if err := Reconstruct(h, r, prior, &out); err != nil {
-		t.Fatalf("reconstruct: %v", err)
+	if err := writePriorOrZeroBlock(prior, 2, make([]byte, testBlockSize), &out); err != nil {
+		t.Fatalf("writePriorOrZeroBlock: %v", err)
 	}
-
-	got := out.Bytes()
-	if len(got) != 5*testBlockSize {
-		t.Fatalf("output length = %d, want %d", len(got), 5*testBlockSize)
-	}
-	// Verify each block came from the right source.
-	want := bytes.Join([][]byte{
-		priorBlock(0),
-		presentBlock(1),
-		priorBlock(2),
-		presentBlock(3),
-		priorBlock(4),
-	}, nil)
-	if !bytes.Equal(got, want) {
-		t.Fatal("reconstructed output mismatch")
-	}
-}
-
-func TestReconstructZeroBlockIsFullPrior(t *testing.T) {
-	// Unchanged file: zero present blocks, reconstructed entirely from prior.
-	data := buildIncrementalFile(t, 3, nil)
-	r := bytes.NewReader(data)
-	h, err := ParseIncrementalHeader(r, testBlockSize)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-
-	prior := mapPrior{blocks: map[uint32][]byte{
-		0: priorBlock(0),
-		1: priorBlock(1),
-		2: priorBlock(2),
-	}}
-
-	var out bytes.Buffer
-	if err := Reconstruct(h, r, prior, &out); err != nil {
-		t.Fatalf("reconstruct: %v", err)
-	}
-	if out.Len() != 3*testBlockSize {
-		t.Fatalf("output length = %d, want %d", out.Len(), 3*testBlockSize)
-	}
-}
-
-func TestReconstructMissingPriorBlockZeroFills(t *testing.T) {
-	// Block 2 is below truncation but present in neither the incremental nor the
-	// prior image (the prior is shorter): it is an uninitialized extension block
-	// and must be reconstructed as zero-filled, matching pg_combinebackup, not
-	// treated as an error.
-	data := buildIncrementalFile(t, 3, []uint32{0})
-	r := bytes.NewReader(data)
-	h, err := ParseIncrementalHeader(r, testBlockSize)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-
-	// mapPrior returns io.EOF for any block it does not hold, modeling a prior
-	// image shorter than the truncation length.
-	prior := mapPrior{blocks: map[uint32][]byte{
-		1: priorBlock(1),
-	}}
-
-	var out bytes.Buffer
-	if err := Reconstruct(h, r, prior, &out); err != nil {
-		t.Fatalf("reconstruct: %v", err)
-	}
-
-	want := bytes.Join([][]byte{
-		presentBlock(0),
-		priorBlock(1),
-		make([]byte, testBlockSize), // block 2: zero-filled
-	}, nil)
-	if !bytes.Equal(out.Bytes(), want) {
-		t.Fatal("reconstructed output mismatch; block 2 should be zero-filled")
+	if !bytes.Equal(out.Bytes(), make([]byte, testBlockSize)) {
+		t.Fatal("absent prior block should be zero-filled")
 	}
 }
 
@@ -279,45 +168,13 @@ type errPrior struct{ err error }
 func (e errPrior) ReadBlock(uint32) ([]byte, error) { return nil, e.err }
 func (errPrior) Close() error                       { return nil }
 
-func TestReconstructPriorReadErrorFails(t *testing.T) {
-	// A genuine (non-EOF) failure reading a needed prior block must still fail
-	// loudly rather than silently zero-filling.
-	data := buildIncrementalFile(t, 2, []uint32{0})
-	r := bytes.NewReader(data)
-	h, err := ParseIncrementalHeader(r, testBlockSize)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-
+func TestWritePriorOrZeroBlockReadErrorFails(t *testing.T) {
+	// A genuine (non-EOF) failure reading a needed prior block must fail loudly
+	// rather than silently zero-filling.
 	boom := errors.New("disk on fire")
-	if err := Reconstruct(h, r, errPrior{err: boom}, &bytes.Buffer{}); !errors.Is(err, ErrBlockNotAvailable) {
+	err := writePriorOrZeroBlock(errPrior{err: boom}, 0, make([]byte, testBlockSize), &bytes.Buffer{})
+	if !errors.Is(err, ErrBlockNotAvailable) {
 		t.Fatalf("expected ErrBlockNotAvailable, got %v", err)
-	}
-}
-
-func TestReconstructReaderFinishUnblocksProducer(t *testing.T) {
-	// A consumer that errors before draining must not leak the producer
-	// goroutine: finish closes the pipe, unblocking the stuck writer.
-	pr, pw := io.Pipe()
-	done := make(chan error, 1)
-	exited := make(chan struct{})
-	go func() {
-		_, err := pw.Write(make([]byte, 1024)) // blocks until pipe is closed
-		pw.CloseWithError(err)
-		done <- err
-		close(exited)
-	}()
-
-	rr := &reconstructReader{pr: pr, done: done}
-	boom := errors.New("downstream write failed")
-	if got := rr.finish(boom); !errors.Is(got, boom) {
-		t.Fatalf("finish returned %v, want %v", got, boom)
-	}
-
-	select {
-	case <-exited:
-	case <-time.After(2 * time.Second):
-		t.Fatal("producer goroutine leaked after finish")
 	}
 }
 

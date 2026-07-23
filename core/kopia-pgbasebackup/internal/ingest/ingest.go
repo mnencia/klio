@@ -29,6 +29,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,6 +41,7 @@ import (
 
 	"github.com/kopia/kopia/fs"
 	"github.com/kopia/kopia/repo"
+	"github.com/kopia/kopia/repo/content"
 	"github.com/kopia/kopia/repo/object"
 	"github.com/kopia/kopia/snapshot"
 	"github.com/kopia/kopia/snapshot/snapshotfs"
@@ -70,6 +72,14 @@ type Options struct {
 	// BlockSize is the PostgreSQL BLCKSZ used for incremental reconstruction.
 	// Defaults to DefaultBlockSize.
 	BlockSize int
+
+	// SegmentBytes is the fixed, block-aligned segment size for segment-
+	// reference storage. Each file is split into segments of this many bytes,
+	// each written as its own object and concatenated into the file object;
+	// an incremental references an unchanged prior segment instead of reading
+	// its blocks back. Defaults to DefaultSegmentBytes. Rounded down to a whole
+	// number of blocks.
+	SegmentBytes int
 }
 
 // Stats holds the counters for an ingest.
@@ -80,6 +90,12 @@ type Stats struct {
 	// ReusedFiles is the number of unchanged files that referenced the prior
 	// object directly instead of reading its blocks back to rebuild it.
 	ReusedFiles int64
+
+	// ReferencedSegments is the number of clean segments an incremental took by
+	// reference from the prior backup (no readback), and RebuiltSegments the
+	// number it rewrote (readback confined to those segments' unchanged blocks).
+	ReferencedSegments int64
+	RebuiltSegments    int64
 }
 
 // Result is the outcome of an ingest, serialized to stdout by the CLI.
@@ -87,6 +103,12 @@ type Result struct {
 	ManifestID   string
 	RootObjectID string
 	Stats        Stats
+
+	// SegmentMap records, per logical file path, the ordered segment object IDs
+	// that make up the file in this backup, plus the segment size. The next
+	// incremental references these to avoid reading unchanged segments back. It
+	// is persisted as a compressed directory-tree snapshot (see SaveSegmentMap).
+	SegmentMap SegmentMap
 }
 
 // PriorImage provides access to a prior backup's files for incremental
@@ -100,6 +122,22 @@ type PriorImage interface {
 	// and size), so an unchanged file can reference the prior object directly
 	// instead of reading and rehashing every block to rebuild an identical one.
 	Entry(relPath string) (*snapshot.DirEntry, error)
+
+	// Segments returns the prior backup's ordered segment object IDs for
+	// relPath, so an incremental can reference an unchanged segment by object ID
+	// instead of reading its blocks back. ok is false when the prior backup has
+	// no recorded segment map for the file (e.g. taken before segmentation), in
+	// which case the caller rebuilds every segment as today.
+	//
+	// Invariant: the returned segments MUST have been produced at the same
+	// SegmentBytes as this ingest. combineSegments derives each referenced
+	// segment's byte length from the current segment size, so a list built at a
+	// different size (same count, different boundaries) can claim a wrong length
+	// and silently corrupt the restore. Enforcing the match is the caller's
+	// responsibility: installPriorSegments in cmd/ingest.go installs the prior
+	// map only when priorBlocks equals the configured segmentBlocks.
+	// combineSegments' structural count check alone is not sufficient.
+	Segments(relPath string) (segments []object.ID, ok bool)
 }
 
 // dirNode is one directory in the tree being assembled. Directories are kept in
@@ -115,6 +153,17 @@ type dirNode struct {
 	gid     uint32
 }
 
+// DefaultSegmentBytes is the default segment size for segment-reference storage
+// (128 KiB). It balances the two costs a segment size trades off: larger
+// segments drag more unchanged data into each rebuilt (dirty) segment, so a
+// scattered change amplifies repo growth; smaller segments multiply the segment
+// objects, the per-backup segment map, and the content index. 128 KiB keeps
+// nearly all of the locality readback win while cutting scattered amplification
+// by more than an order of magnitude versus a multi-megabyte segment, and its
+// index/maintenance cost is already near the floor. It is a whole number of
+// blocks for any BLCKSZ up to 128 KiB.
+const DefaultSegmentBytes = 128 << 10
+
 // assembler builds a snapshot from a tar stream.
 type assembler struct {
 	ctx   context.Context //nolint:containedctx // bound to a single ingest call
@@ -123,6 +172,42 @@ type assembler struct {
 	start time.Time
 	dirs  map[string]*dirNode
 	stats Stats
+
+	// segmentBlocks is the segment size in blocks (SegmentBytes / BlockSize).
+	segmentBlocks int
+	// segMap records this backup's per-file ordered segment object IDs, carried
+	// forward so the next incremental can reference unchanged segments.
+	segMap map[string][]object.ID
+}
+
+// segRef is a segment object together with the logical byte length it
+// contributes to its file. The length is known at write time (freshly written or
+// referenced from the prior), so the file's index can be built without reading
+// any segment back — see finishFile / buildFileObject.
+type segRef struct {
+	oid    object.ID
+	length int64
+}
+
+// Kopia encodes a multi-segment ("indirect") object as a small JSON seek-table
+// content, prefixed like the index content below, whose object ID is the index
+// content's ID string with one leading "I" per indirection level. These mirror
+// the (unexported) kopia writer so the helper can build a file's index from
+// segment IDs and their known lengths, instead of calling ConcatenateObjects
+// (which opens every segment just to rediscover those lengths — on the server
+// path that re-reads the whole backup).
+const indirectContentPrefix content.IDPrefix = "x"
+
+const (
+	indirectObjectPrefix = "I"
+	indirectStreamID     = "kopia:indirect"
+)
+
+// indirectIndex is the on-object JSON layout kopia reads for a multi-segment
+// object (see object.LoadIndexObject); it must match kopia's format exactly.
+type indirectIndex struct {
+	StreamID string                       `json:"stream"`
+	Entries  []object.IndirectObjectEntry `json:"entries"`
 }
 
 // Run ingests the tar stream and saves a snapshot, returning its identifiers.
@@ -130,15 +215,21 @@ func Run(ctx context.Context, rep repo.RepositoryWriter, tarStream io.Reader, op
 	if opts.BlockSize <= 0 {
 		opts.BlockSize = DefaultBlockSize
 	}
+	if opts.SegmentBytes <= 0 {
+		opts.SegmentBytes = DefaultSegmentBytes
+	}
+	segmentBlocks := SegmentBlocksFor(opts.SegmentBytes, opts.BlockSize)
 
 	start := time.Now()
 
 	a := &assembler{
-		ctx:   ctx,
-		rep:   rep,
-		opts:  opts,
-		start: start,
-		dirs:  map[string]*dirNode{},
+		ctx:           ctx,
+		rep:           rep,
+		opts:          opts,
+		start:         start,
+		dirs:          map[string]*dirNode{},
+		segmentBlocks: segmentBlocks,
+		segMap:        map[string][]object.ID{},
 	}
 	// The data directory root is not a tar member, so default it to the mode
 	// PostgreSQL uses for PGDATA.
@@ -176,7 +267,38 @@ func Run(ctx context.Context, rep repo.RepositoryWriter, tarStream io.Reader, op
 		ManifestID:   string(manID),
 		RootObjectID: rootEntry.ObjectID.String(),
 		Stats:        a.stats,
+		SegmentMap:   a.serializeSegmentMap(),
 	}, nil
+}
+
+// SegmentBlocksFor returns the segment size in blocks for the given byte and
+// block sizes, applying the same defaults Run uses. It is the single source of
+// truth so the caller can gate prior-segment referencing on the same value.
+func SegmentBlocksFor(segmentBytes, blockSize int) int {
+	if blockSize <= 0 {
+		blockSize = DefaultBlockSize
+	}
+	if segmentBytes <= 0 {
+		segmentBytes = DefaultSegmentBytes
+	}
+
+	return max(segmentBytes/blockSize, 1)
+}
+
+// serializeSegmentMap renders this backup's per-file segment object IDs as the
+// self-describing SegmentMap, recording the segment size so an incremental can
+// tell whether the size still matches before referencing.
+func (a *assembler) serializeSegmentMap() SegmentMap {
+	files := make(map[string][]string, len(a.segMap))
+	for p, ids := range a.segMap {
+		strs := make([]string, len(ids))
+		for i, id := range ids {
+			strs[i] = id.String()
+		}
+		files[p] = strs
+	}
+
+	return SegmentMap{SegmentBlocks: a.segmentBlocks, Files: files}
 }
 
 // backupLabelFile is the name of the PostgreSQL backup label file.
@@ -368,10 +490,7 @@ func (a *assembler) writeDir(node *dirNode) (*snapshot.DirEntry, error) {
 
 // fileContent resolves the content reader and logical path for a plain tar file
 // member. On an incremental backup it strips the INCREMENTAL FROM lines from
-// backup_label so the combined tree is a self-contained full backup. The
-// returned finish is a no-op here; INCREMENTAL.* members are handled separately
-// by addIncrementalFile. The finish signature is kept so writeFile can serve
-// both paths.
+// backup_label so the combined tree is a self-contained full backup.
 func (a *assembler) fileContent(
 	tr *tar.Reader, name string,
 ) (io.Reader, string, func(error) error, error) {
@@ -403,32 +522,138 @@ func (a *assembler) addFile(tr *tar.Reader, hdr *tar.Header, name string) (*snap
 		return nil, "", err
 	}
 
-	return a.writeFile(hdr, logical, content, finish)
+	return a.writeSegmentedFile(hdr, logical, content, finish)
 }
 
-// writeFile streams content into a new repository object and returns the file's
-// DirEntry. finish reconciles the io.Copy error with any background producer
-// (incremental reconstruction); for plain members it is a no-op.
-func (a *assembler) writeFile(
+// writeSegmentedFile splits content into fixed-size segment objects, records
+// their IDs for the segment map, and returns a DirEntry whose object is their
+// concatenation. finish reconciles any producer error (a no-op for plain
+// members).
+func (a *assembler) writeSegmentedFile(
 	hdr *tar.Header, logical string, content io.Reader, finish func(error) error,
 ) (*snapshot.DirEntry, string, error) {
-	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "FILE:" + logical})
-	defer writer.Close() //nolint:errcheck
+	segBytes := int64(a.segmentBlocks * a.opts.BlockSize)
 
-	written, copyErr := io.Copy(writer, content)
-	if err := finish(copyErr); err != nil {
+	var (
+		segs    []segRef
+		written int64
+	)
+	for {
+		oid, n, err := a.writeSegment(content, segBytes, logical)
+		if err != nil {
+			_ = finish(err)
+
+			return nil, "", fmt.Errorf("while writing file %q: %w", logical, err)
+		}
+		if n == 0 {
+			break // end of content
+		}
+		segs = append(segs, segRef{oid: oid, length: n})
+		written += n
+		if n < segBytes {
+			break // last, short segment
+		}
+	}
+	if err := finish(nil); err != nil {
 		return nil, "", fmt.Errorf("while writing file %q: %w", logical, err)
 	}
 
-	oid, err := writer.Result()
+	oid, err := a.finishFile(logical, segs)
 	if err != nil {
-		return nil, "", fmt.Errorf("while finalizing file %q: %w", logical, err)
+		return nil, "", err
 	}
 
 	a.stats.FileCount++
 	a.stats.TotalSize += written
 
 	return a.fileEntry(hdr, logical, oid, written), logical, nil
+}
+
+// writeSegment writes up to limit bytes from content into a new object,
+// returning its ID and the number of bytes written (0 at end of content).
+func (a *assembler) writeSegment(content io.Reader, limit int64, logical string) (object.ID, int64, error) {
+	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + logical})
+	defer writer.Close() //nolint:errcheck
+
+	n, err := io.CopyN(writer, content, limit)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return object.EmptyID, 0, err
+	}
+	if n == 0 {
+		return object.EmptyID, 0, nil
+	}
+
+	oid, err := writer.Result()
+
+	return oid, n, err
+}
+
+// finishFile records a file's segment list for the segment map and resolves its
+// object ID. A single-segment (or empty) file is its own object. A multi-segment
+// file's object is an indirect (seek-table) object built from the segments'
+// known lengths — see buildFileObject. This never reads the segments back, so it
+// is safe to run inline (no flush) and avoids the whole-backup re-read that
+// object.ConcatenateObjects incurs on the server path.
+func (a *assembler) finishFile(logical string, segs []segRef) (object.ID, error) {
+	if len(segs) == 0 {
+		writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + logical})
+		defer writer.Close() //nolint:errcheck
+		oid, err := writer.Result()
+		if err != nil {
+			return object.EmptyID, fmt.Errorf("while writing empty file %q: %w", logical, err)
+		}
+		segs = []segRef{{oid: oid, length: 0}}
+	}
+
+	ids := make([]object.ID, len(segs))
+	for i, s := range segs {
+		ids[i] = s.oid
+	}
+	a.segMap[logical] = ids
+
+	if len(segs) == 1 {
+		return segs[0].oid, nil
+	}
+
+	return a.buildFileObject(logical, segs)
+}
+
+// buildFileObject writes a file's indirect (seek-table) object from its segments
+// and their known lengths, returning its object ID. It reimplements
+// object.ConcatenateObjects for single-content segments without opening any of
+// them: ConcatenateObjects opens every input to rediscover its length, which on
+// the server path re-reads the entire backup's data. The written index and the
+// derived object ID match kopia's own format (see the indirect* constants), so
+// the result is read back like any concatenated object.
+func (a *assembler) buildFileObject(logical string, segs []segRef) (object.ID, error) {
+	entries := make([]object.IndirectObjectEntry, len(segs))
+	var start int64
+	for i, s := range segs {
+		entries[i] = object.IndirectObjectEntry{Start: start, Length: s.length, Object: s.oid}
+		start += s.length
+	}
+
+	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{
+		Description: "SEGIDX:" + logical,
+		Prefix:      indirectContentPrefix,
+	})
+	defer writer.Close() //nolint:errcheck
+
+	if err := json.NewEncoder(writer).Encode(indirectIndex{StreamID: indirectStreamID, Entries: entries}); err != nil {
+		return object.EmptyID, fmt.Errorf("while encoding segment index of %q: %w", logical, err)
+	}
+
+	indexOID, err := writer.Result()
+	if err != nil {
+		return object.EmptyID, fmt.Errorf("while writing segment index of %q: %w", logical, err)
+	}
+
+	oid, err := object.ParseID(indirectObjectPrefix + indexOID.String())
+	if err != nil {
+		return object.EmptyID, fmt.Errorf("while forming file object of %q: %w", logical, err)
+	}
+
+	return oid, nil
 }
 
 // fileEntry builds a file DirEntry from the tar header metadata plus a resolved
@@ -446,39 +671,11 @@ func (a *assembler) fileEntry(hdr *tar.Header, logical string, oid object.ID, si
 	}
 }
 
-// reconstructReader streams the reconstructed full image produced by a
-// background Reconstruct goroutine. The consumer must call finish to release
-// the goroutine (and the prior image it holds) and to learn the real error.
-type reconstructReader struct {
-	pr   *io.PipeReader
-	done <-chan error
-}
-
-func (r *reconstructReader) Read(p []byte) (int, error) { return r.pr.Read(p) }
-
-// finish reconciles the consumer's io.Copy error with the reconstruction
-// result. It must be called exactly once after the io.Copy that drained Read.
-//
-// Closing the pipe reader unblocks the producer if io.Copy stopped early
-// (e.g. a repository write error), preventing a goroutine leak and ensuring the
-// prior image is closed. When io.Copy failed, that error is the root cause
-// (it is either the reconstruction error propagated through the pipe, or the
-// downstream write error that aborted the copy), so it is preferred.
-func (r *reconstructReader) finish(copyErr error) error {
-	r.pr.CloseWithError(copyErr) //nolint:gosec // always returns nil
-	recErr := <-r.done
-	if copyErr != nil {
-		return copyErr
-	}
-
-	return recErr
-}
-
 // addIncrementalFile combines an INCREMENTAL.* member against the prior image
 // and returns the resulting file DirEntry and its logical path (INCREMENTAL.
-// prefix stripped). A file with no changed blocks whose length still matches
-// the prior reuses the prior object directly (metadata only, no block reads);
-// otherwise the full image is reconstructed block by block and written.
+// prefix stripped). An unchanged file references the prior object directly; a
+// changed file is combined segment by segment, referencing unchanged segments
+// from the prior and rebuilding only those that contain a changed block.
 func (a *assembler) addIncrementalFile(
 	tr *tar.Reader, hdr *tar.Header, name string,
 ) (*snapshot.DirEntry, string, error) {
@@ -492,18 +689,10 @@ func (a *assembler) addIncrementalFile(
 		return nil, "", fmt.Errorf("incremental member %q but no prior image configured", name)
 	}
 
-	// Metadata-only fast path: with no changed blocks the rebuilt file would be
-	// byte-identical to the prior object, so reference that object directly
-	// instead of reading every block back to rebuild and re-hash an identical
-	// file. Block-level reconstruction plus Kopia dedup converges on the same
-	// object; this skips the read-back and rehash. A file that shrank
-	// (truncation shorter than the prior) falls through to reconstruct its
-	// prefix, which is a genuinely different object.
+	// Metadata-only fast path: with no changed blocks and an unchanged length,
+	// the whole file is byte-identical to the prior, so reference the prior
+	// object directly and carry its segment list forward unchanged.
 	if len(header.BlockNumbers) == 0 {
-		// A zero-block incremental is header-only. Reject trailing data before
-		// trusting it, the same integrity check reconstruction applies via
-		// assertDrained (the fast path never reaches Reconstruct). A well-formed
-		// member is already at EOF here, so this consumes nothing.
 		if err := assertDrained(tr, make([]byte, 1)); err != nil {
 			return nil, "", fmt.Errorf("while combining %q: %w", name, err)
 		}
@@ -513,43 +702,185 @@ func (a *assembler) addIncrementalFile(
 			return nil, "", fmt.Errorf("while resolving prior entry for %q: %w", relPath, err)
 		}
 
-		// Reuse the prior object only when the file is unchanged in full (its
-		// length still matches). A shrunk file (shorter truncation) is a genuine
-		// prefix of the prior, so it falls through to reconstruct that prefix.
 		if prior.FileSize == int64(header.TruncationBlockLength)*int64(a.opts.BlockSize) {
 			a.stats.FileCount++
 			a.stats.ReusedFiles++
 			a.stats.TotalSize += prior.FileSize
+			a.carryPriorSegments(relPath, prior.ObjectID)
 
 			return a.fileEntry(hdr, relPath, prior.ObjectID, prior.FileSize), relPath, nil
 		}
 	}
 
-	prior, err := a.opts.Prior.BlockReader(relPath, a.opts.BlockSize)
-	if err != nil {
-		return nil, "", fmt.Errorf("while opening prior image of %q: %w", relPath, err)
-	}
-
-	reader := startReconstruct(header, tr, prior)
-
-	return a.writeFile(hdr, relPath, reader, reader.finish)
+	return a.combineSegments(tr, hdr, header, relPath)
 }
 
-// startReconstruct spawns the reconstruction of an incremental member against
-// its prior image and returns a reader streaming the rebuilt full image. The
-// caller must call the reader's finish exactly once to release the goroutine
-// (and the prior image) and to learn the real error.
-func startReconstruct(header *IncrementalHeader, blockData io.Reader, prior PriorBlockReader) *reconstructReader {
-	pr, pw := io.Pipe()
-	done := make(chan error, 1)
-	go func() {
-		defer prior.Close() //nolint:errcheck
-		err := Reconstruct(header, blockData, prior, pw)
-		pw.CloseWithError(err)
-		done <- err
-	}()
+// carryPriorSegments records, for a file taken by the whole-file reuse path,
+// the prior backup's segment list so the next incremental can still reference
+// this file's segments. When the prior has no recorded segments (a
+// pre-segmentation backup), the whole object is recorded as a single segment.
+func (a *assembler) carryPriorSegments(relPath string, priorOID object.ID) {
+	if segs, ok := a.opts.Prior.Segments(relPath); ok {
+		a.segMap[relPath] = segs
 
-	return &reconstructReader{pr: pr, done: done}
+		return
+	}
+	// The prior recorded no segment list (a pre-segmentation backup, or a chain
+	// whose size changed and left the map uninstalled). Recording the whole-file
+	// object as one "segment" is correct only when the file fits in a single
+	// segment; for a multi-segment file the next incremental would splice the
+	// whole file into the segment-0 slot and corrupt the reconstruction. So
+	// record it only when it is genuinely one segment, else omit the file and let
+	// the next incremental rebuild every segment.
+	if a.priorBlockCount(relPath) <= a.segmentBlocks {
+		a.segMap[relPath] = []object.ID{priorOID}
+	}
+}
+
+// combineSegments rebuilds a changed file segment by segment. A segment with no
+// changed block is referenced from the prior (no readback) when its byte range
+// matches the prior's same-index segment; otherwise it is rebuilt from the
+// incremental blocks and the prior's unchanged blocks. The per-segment objects
+// are concatenated into the file object.
+//
+// integrity checks read clearer as one sequential function than split apart.
+//
+//nolint:cyclop // the per-segment reference/rebuild walk plus its end-of-stream
+func (a *assembler) combineSegments(
+	blockData io.Reader, hdr *tar.Header, h *IncrementalHeader, relPath string,
+) (*snapshot.DirEntry, string, error) {
+	sb := a.segmentBlocks
+	total := int(h.TruncationBlockLength)
+	priorBlocks := a.priorBlockCount(relPath)
+	priorSegs, _ := a.opts.Prior.Segments(relPath)
+
+	// Only reference prior segments when the prior segment list is structurally
+	// consistent with the prior file length (exactly one object per sb-block
+	// segment). An inconsistent list — e.g. a whole-file object carried as a
+	// single segment for a multi-segment file — must never be spliced; rebuild
+	// every segment instead. This both rejects such a map and heals a chain
+	// whose earlier backup persisted one. This count check assumes the prior map
+	// was produced at the current segment size; that size match is the caller's
+	// responsibility (see PriorImage.Segments), not verified here.
+	canReference := len(priorSegs) == (priorBlocks+sb-1)/sb
+
+	var reader PriorBlockReader
+	defer func() {
+		if reader != nil {
+			_ = reader.Close()
+		}
+	}()
+	ensureReader := func() (PriorBlockReader, error) {
+		if reader == nil {
+			r, err := a.opts.Prior.BlockReader(relPath, a.opts.BlockSize)
+			if err != nil {
+				return nil, fmt.Errorf("while opening prior image of %q: %w", relPath, err)
+			}
+			reader = r
+		}
+
+		return reader, nil
+	}
+
+	buf := make([]byte, a.opts.BlockSize)
+	zeroBlock := make([]byte, a.opts.BlockSize)
+	cursor := 0 // index into h.BlockNumbers
+	var segs []segRef
+
+	for start := 0; start < total; start += sb {
+		end := min(start+sb, total)
+		dirty := cursor < len(h.BlockNumbers) && int(h.BlockNumbers[cursor]) < end
+		j := start / sb
+		priorEnd := min(start+sb, priorBlocks)
+		segLen := int64(end-start) * int64(a.opts.BlockSize)
+
+		if !dirty && canReference && j < len(priorSegs) && end == priorEnd {
+			segs = append(segs, segRef{oid: priorSegs[j], length: segLen})
+			a.stats.ReferencedSegments++
+
+			continue
+		}
+
+		oid, err := a.rebuildSegment(blockData, h, &cursor, start, end, buf, zeroBlock, ensureReader, relPath)
+		if err != nil {
+			return nil, "", err
+		}
+		segs = append(segs, segRef{oid: oid, length: segLen})
+		a.stats.RebuiltSegments++
+	}
+
+	if cursor != len(h.BlockNumbers) {
+		return nil, "", fmt.Errorf("%w: consumed %d of %d present blocks",
+			ErrReconstructIncomplete, cursor, len(h.BlockNumbers))
+	}
+	if err := assertDrained(blockData, buf[:1]); err != nil {
+		return nil, "", fmt.Errorf("while combining %q: %w", relPath, err)
+	}
+
+	oid, err := a.finishFile(relPath, segs)
+	if err != nil {
+		return nil, "", err
+	}
+
+	size := int64(total) * int64(a.opts.BlockSize)
+	a.stats.FileCount++
+	a.stats.TotalSize += size
+
+	return a.fileEntry(hdr, relPath, oid, size), relPath, nil
+}
+
+// rebuildSegment writes one segment covering output blocks [start, end): a
+// present block comes from blockData (advancing cursor), an absent one from the
+// prior image.
+func (a *assembler) rebuildSegment(
+	blockData io.Reader, h *IncrementalHeader, cursor *int, start, end int, buf, zeroBlock []byte,
+	ensureReader func() (PriorBlockReader, error), relPath string,
+) (object.ID, error) {
+	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + relPath})
+	defer writer.Close() //nolint:errcheck
+
+	for i := start; i < end; i++ {
+		if *cursor < len(h.BlockNumbers) && int(h.BlockNumbers[*cursor]) == i {
+			if _, err := io.ReadFull(blockData, buf); err != nil {
+				return object.EmptyID, fmt.Errorf("while reading incremental block %d: %w", i, err)
+			}
+			*cursor++
+			if _, err := writer.Write(buf); err != nil {
+				return object.EmptyID, fmt.Errorf("while writing block %d: %w", i, err)
+			}
+
+			continue
+		}
+
+		reader, err := ensureReader()
+		if err != nil {
+			return object.EmptyID, err
+		}
+		// A block beyond the prior image is an uninitialized extension block:
+		// zero-fill it, matching pg_combinebackup (see writePriorOrZeroBlock).
+		blockNum := uint32(i) //nolint:gosec // block index fits uint32
+		if werr := writePriorOrZeroBlock(reader, blockNum, zeroBlock, writer); werr != nil {
+			return object.EmptyID, werr
+		}
+	}
+
+	oid, err := writer.Result()
+	if err != nil {
+		return object.EmptyID, fmt.Errorf("while finalizing segment of %q: %w", relPath, err)
+	}
+
+	return oid, nil
+}
+
+// priorBlockCount returns the prior file's length in blocks, or 0 when the file
+// is absent from the prior (a new file, which has no segments to reference).
+func (a *assembler) priorBlockCount(relPath string) int {
+	entry, err := a.opts.Prior.Entry(relPath)
+	if err != nil {
+		return 0
+	}
+
+	return int(entry.FileSize) / a.opts.BlockSize
 }
 
 // addSymlink stores a symbolic link, writing its target as the object content

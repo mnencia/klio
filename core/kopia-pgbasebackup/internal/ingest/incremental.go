@@ -79,9 +79,6 @@ type IncrementalHeader struct {
 	// TruncationBlockLength is the length, in blocks, that the reconstructed
 	// relation segment must have.
 	TruncationBlockLength uint32
-
-	// blockSize is the BLCKSZ used for header padding and block data.
-	blockSize int
 }
 
 // ParseIncrementalHeader reads and validates the header of an INCREMENTAL.*
@@ -110,7 +107,7 @@ func ParseIncrementalHeader(r io.Reader, blockSize int) (*IncrementalHeader, err
 		return nil, err
 	}
 
-	// Present blocks must lie strictly below the truncation length. Reconstruct
+	// Present blocks must lie strictly below the truncation length. The combine
 	// only walks output blocks in [0, truncation), so a block at or beyond it
 	// would never be read from the data section, silently corrupting the result.
 	if n := len(blockNumbers); n > 0 && blockNumbers[n-1] >= truncation {
@@ -135,7 +132,6 @@ func ParseIncrementalHeader(r io.Reader, blockSize int) (*IncrementalHeader, err
 	return &IncrementalHeader{
 		BlockNumbers:          blockNumbers,
 		TruncationBlockLength: truncation,
-		blockSize:             blockSize,
 	}, nil
 }
 
@@ -170,60 +166,6 @@ func readAscendingBlockNumbers(r io.Reader, n uint32) ([]uint32, error) {
 type PriorBlockReader interface {
 	ReadBlock(n uint32) ([]byte, error)
 	io.Closer
-}
-
-// Reconstruct combines an incremental file into a full relation segment in a
-// single forward pass and writes the result to out. blockData must be
-// positioned at the first incremental block (i.e. after ParseIncrementalHeader).
-//
-// For each output block i in [0, TruncationBlockLength): if i is present in the
-// incremental file, the next block is taken from blockData (which arrives in
-// ascending order, matching the forward walk of i); otherwise the block is read
-// from prior. Identical reconstructed blocks deduplicate against the prior in
-// the repository automatically.
-func Reconstruct(
-	h *IncrementalHeader,
-	blockData io.Reader,
-	prior PriorBlockReader,
-	out io.Writer,
-) error {
-	blockSize := h.blockSize
-	if blockSize <= 0 {
-		blockSize = DefaultBlockSize
-	}
-
-	buf := make([]byte, blockSize)
-	zeroBlock := make([]byte, blockSize)
-	cursor := 0 // index into h.BlockNumbers
-
-	for i := range h.TruncationBlockLength {
-		if cursor < len(h.BlockNumbers) && h.BlockNumbers[cursor] == i {
-			if _, err := io.ReadFull(blockData, buf); err != nil {
-				return fmt.Errorf("while reading incremental block %d: %w", i, err)
-			}
-			cursor++
-			if _, err := out.Write(buf); err != nil {
-				return fmt.Errorf("while writing block %d: %w", i, err)
-			}
-
-			continue
-		}
-
-		if err := writePriorOrZeroBlock(prior, i, zeroBlock, out); err != nil {
-			return err
-		}
-	}
-
-	// Every present block must have been consumed; otherwise the data section
-	// held blocks the forward walk never reached and the output is corrupt.
-	if cursor != len(h.BlockNumbers) {
-		return fmt.Errorf("%w: consumed %d of %d present blocks",
-			ErrReconstructIncomplete, cursor, len(h.BlockNumbers))
-	}
-
-	// The data section must be fully drained; otherwise the header under-counted
-	// the blocks present in the file.
-	return assertDrained(blockData, buf[:1])
 }
 
 // writePriorOrZeroBlock writes output block i from the prior image. A block at
