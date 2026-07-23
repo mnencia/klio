@@ -42,10 +42,12 @@ var (
 	// start with the expected magic number.
 	ErrBadIncrementalMagic = errors.New("invalid incremental file magic")
 
-	// ErrBlockNotAvailable is returned during reconstruction when a block is
-	// neither present in the incremental file nor readable from the prior
-	// image. This is the defensive check from the design (relation extension).
-	ErrBlockNotAvailable = errors.New("block missing from both incremental and prior image")
+	// ErrBlockNotAvailable is returned during reconstruction when a block that
+	// is not in the incremental cannot be read from the prior image for a
+	// genuine reason (an I/O or decode error, not merely being past the prior's
+	// end). A block simply beyond the prior image is treated as a zero-filled
+	// uninitialized extension block, matching PostgreSQL's pg_combinebackup.
+	ErrBlockNotAvailable = errors.New("prior image block could not be read")
 
 	// ErrBlocksNotAscending is returned when the present-block array is not
 	// sorted ascending, which the single-pass reconstruction relies on.
@@ -191,6 +193,7 @@ func Reconstruct(
 	}
 
 	buf := make([]byte, blockSize)
+	zeroBlock := make([]byte, blockSize)
 	cursor := 0 // index into h.BlockNumbers
 
 	for i := range h.TruncationBlockLength {
@@ -206,12 +209,8 @@ func Reconstruct(
 			continue
 		}
 
-		block, err := prior.ReadBlock(i)
-		if err != nil {
-			return fmt.Errorf("%w: block %d: %w", ErrBlockNotAvailable, i, err)
-		}
-		if _, err := out.Write(block); err != nil {
-			return fmt.Errorf("while writing prior block %d: %w", i, err)
+		if err := writePriorOrZeroBlock(prior, i, zeroBlock, out); err != nil {
+			return err
 		}
 	}
 
@@ -225,6 +224,31 @@ func Reconstruct(
 	// The data section must be fully drained; otherwise the header under-counted
 	// the blocks present in the file.
 	return assertDrained(blockData, buf[:1])
+}
+
+// writePriorOrZeroBlock writes output block i from the prior image. A block at
+// or beyond the prior image (io.EOF) is one the server extended the file to but
+// never WAL-logged (an uninitialized page); PostgreSQL's pg_combinebackup
+// materializes it as zero-filled, so match that rather than failing. Any other
+// read failure is a genuine error.
+func writePriorOrZeroBlock(prior PriorBlockReader, i uint32, zeroBlock []byte, out io.Writer) error {
+	block, err := prior.ReadBlock(i)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			if _, werr := out.Write(zeroBlock); werr != nil {
+				return fmt.Errorf("while writing zero-filled block %d: %w", i, werr)
+			}
+
+			return nil
+		}
+
+		return fmt.Errorf("%w: block %d: %w", ErrBlockNotAvailable, i, err)
+	}
+	if _, err := out.Write(block); err != nil {
+		return fmt.Errorf("while writing prior block %d: %w", i, err)
+	}
+
+	return nil
 }
 
 // assertDrained verifies r is at EOF, using scratch as a one-byte probe buffer.

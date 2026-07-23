@@ -113,6 +113,12 @@ type IngestStats struct {
 	// much read-back the incremental reuse fast path avoided.
 	ReusedFiles    int64 `json:"reusedFiles"`
 	PriorReadBytes int64 `json:"priorReadBytes"`
+
+	// ZeroFilledBlocks is the number of below-truncation blocks present in
+	// neither the incremental nor the prior image, materialized as zero-filled
+	// uninitialized extension blocks (matching pg_combinebackup). Normally
+	// small; a spike may indicate a WAL-summary anomaly worth investigating.
+	ZeroFilledBlocks int64 `json:"zeroFilledBlocks"`
 }
 
 // IngestResult is the single JSON object the helper prints on stdout when an
@@ -192,7 +198,8 @@ func (c *PgBaseBackupClient) Ingest(
 		"cachedBytes", result.Stats.CachedBytes,
 		"fileCount", result.Stats.FileCount,
 		"reusedFiles", result.Stats.ReusedFiles,
-		"priorReadBytes", result.Stats.PriorReadBytes)
+		"priorReadBytes", result.Stats.PriorReadBytes,
+		"zeroFilledBlocks", result.Stats.ZeroFilledBlocks)
 
 	return result, nil
 }

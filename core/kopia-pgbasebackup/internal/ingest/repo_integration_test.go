@@ -544,6 +544,56 @@ func TestIncrementalUnchangedFileReusesPriorObject(t *testing.T) {
 	}
 }
 
+// TestIncrementalExtendedFileZeroFillsUninitializedBlock is the regression test
+// for the field failure on base/16385/2619 (pg_statistic): a relation grew
+// since the prior backup, but its trailing block was extended without being
+// WAL-logged, so the incremental omits it (below truncation) and the prior
+// image is shorter. Reconstruction must zero-fill that block, matching
+// PostgreSQL's pg_combinebackup, rather than failing the backup.
+func TestIncrementalExtendedFileZeroFillsUninitializedBlock(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+	modTime := time.Unix(1_700_000_000, 0)
+
+	// Full backup: a 2-block relation.
+	fullRelation := bytes.Join([][]byte{priorBlock(0), priorBlock(1)}, nil)
+	fullTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/1259", typeflag: tar.TypeReg, mode: 0o600, data: fullRelation, modTime: modTime},
+	})
+	full := ingestTar(ctx, t, configFile, fullTar,
+		Options{Source: defaultSource(), BlockSize: testBlockSize}, nil)
+
+	// Incremental: the file grew to 3 blocks with no WAL-logged change (zero
+	// present blocks, truncation 3). Block 2 lies beyond the 2-block prior.
+	incMember := buildIncrementalFile(t, 3, nil)
+	incTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/INCREMENTAL.1259", typeflag: tar.TypeReg, mode: 0o600, data: incMember, modTime: modTime},
+	})
+	inc := ingestTar(ctx, t, configFile, incTar,
+		Options{Source: defaultSource(), Incremental: true, BlockSize: testBlockSize},
+		func(w repo.RepositoryWriter, opts *Options) {
+			priorMan, err := snapshot.LoadSnapshot(ctx, w, manifest.ID(full.ManifestID))
+			if err != nil {
+				t.Fatalf("load prior snapshot: %v", err)
+			}
+			opts.Prior = NewKopiaPriorImage(ctx, w, priorMan.RootEntry.ObjectID)
+		})
+
+	out := filepath.Join(t.TempDir(), "restored")
+	restoreSnapshot(ctx, t, configFile, inc.ManifestID, out)
+
+	want := bytes.Join([][]byte{
+		priorBlock(0),
+		priorBlock(1),
+		make([]byte, testBlockSize), // block 2: uninitialized extension, zero-filled
+	}, nil)
+	assertFileEqual(t, filepath.Join(out, "base/1/1259"), want)
+}
+
 // ingestTarErr runs an ingest and returns the run error (nil on success) instead
 // of failing the test, for adversarial cases that must be rejected.
 func ingestTarErr(

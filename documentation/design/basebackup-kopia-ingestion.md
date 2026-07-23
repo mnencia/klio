@@ -375,9 +375,12 @@ that would break all three at once.
 
 ### Edge cases
 
-- Relation extension: new blocks are always present in the incremental, by
-  construction. A block that is neither present nor available from the prior is
-  a defensive error.
+- Relation extension: a block below the truncation length that is present in
+  neither the incremental nor the prior image is one PostgreSQL extended the
+  file to but never WAL-logged (an uninitialized page). It is reconstructed as
+  a zero-filled block, matching PostgreSQL's `pg_combinebackup`, and counted in
+  the ingest stats (`zeroFilledBlocks`). See Limitations. A block that cannot be
+  read from the prior for a genuine reason (an I/O error) is still a hard error.
 - Relation truncation: the rebuild stops at the truncation block length and does
   not copy prior blocks beyond it.
 - Segmented relations (larger than 1 GB, split into `.1`, `.2`, and so on): each
@@ -474,6 +477,13 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
 - A full backup over the stream gives up Kopia's skip of unchanged files. That
   is a CPU cost only, not a transfer or storage cost, and incremental backup
   avoids it.
+- Incremental reconstruction, like PostgreSQL's `pg_combinebackup`, cannot
+  distinguish a genuinely uninitialized (all-zero) extension page from one whose
+  modification the WAL summaries failed to record. A below-truncation block
+  present in neither the incremental nor the prior image is assumed
+  uninitialized and materialized as zeros; WAL replay reinitializes such pages
+  on recovery. The `zeroFilledBlocks` ingest stat surfaces how often this
+  happens so an anomaly is visible rather than silent.
 
 ## Code map
 

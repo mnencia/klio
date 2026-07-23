@@ -239,18 +239,58 @@ func TestReconstructZeroBlockIsFullPrior(t *testing.T) {
 	}
 }
 
-func TestReconstructMissingPriorBlockErrors(t *testing.T) {
-	// Block 2 is neither present nor in prior: defensive error.
+func TestReconstructMissingPriorBlockZeroFills(t *testing.T) {
+	// Block 2 is below truncation but present in neither the incremental nor the
+	// prior image (the prior is shorter): it is an uninitialized extension block
+	// and must be reconstructed as zero-filled, matching pg_combinebackup, not
+	// treated as an error.
 	data := buildIncrementalFile(t, 3, []uint32{0})
 	r := bytes.NewReader(data)
-	h, _ := ParseIncrementalHeader(r, testBlockSize)
+	h, err := ParseIncrementalHeader(r, testBlockSize)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 
+	// mapPrior returns io.EOF for any block it does not hold, modeling a prior
+	// image shorter than the truncation length.
 	prior := mapPrior{blocks: map[uint32][]byte{
 		1: priorBlock(1),
 	}}
 
-	err := Reconstruct(h, r, prior, &bytes.Buffer{})
-	if !errors.Is(err, ErrBlockNotAvailable) {
+	var out bytes.Buffer
+	if err := Reconstruct(h, r, prior, &out); err != nil {
+		t.Fatalf("reconstruct: %v", err)
+	}
+
+	want := bytes.Join([][]byte{
+		presentBlock(0),
+		priorBlock(1),
+		make([]byte, testBlockSize), // block 2: zero-filled
+	}, nil)
+	if !bytes.Equal(out.Bytes(), want) {
+		t.Fatal("reconstructed output mismatch; block 2 should be zero-filled")
+	}
+}
+
+// errPrior returns a non-EOF error for every block, modeling a genuine read
+// failure (I/O or decode error) as opposed to a block merely past the end.
+type errPrior struct{ err error }
+
+func (e errPrior) ReadBlock(uint32) ([]byte, error) { return nil, e.err }
+func (errPrior) Close() error                       { return nil }
+
+func TestReconstructPriorReadErrorFails(t *testing.T) {
+	// A genuine (non-EOF) failure reading a needed prior block must still fail
+	// loudly rather than silently zero-filling.
+	data := buildIncrementalFile(t, 2, []uint32{0})
+	r := bytes.NewReader(data)
+	h, err := ParseIncrementalHeader(r, testBlockSize)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	boom := errors.New("disk on fire")
+	if err := Reconstruct(h, r, errPrior{err: boom}, &bytes.Buffer{}); !errors.Is(err, ErrBlockNotAvailable) {
 		t.Fatalf("expected ErrBlockNotAvailable, got %v", err)
 	}
 }

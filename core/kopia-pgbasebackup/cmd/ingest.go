@@ -106,6 +106,12 @@ type outputStats struct {
 	// incremental's read-back the reuse fast path avoided.
 	ReusedFiles    int64 `json:"reusedFiles"`
 	PriorReadBytes int64 `json:"priorReadBytes"`
+
+	// ZeroFilledBlocks is the number of below-truncation blocks that were
+	// present in neither the incremental nor the prior image and so were
+	// materialized as zero-filled uninitialized extension blocks. Normally
+	// small; a spike may indicate a WAL-summary anomaly worth investigating.
+	ZeroFilledBlocks int64 `json:"zeroFilledBlocks"`
 }
 
 func runIngest(cmd *cobra.Command, _ []string) error {
@@ -157,19 +163,20 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	}
 	defer rep.Close(ctx) //nolint:errcheck
 
-	result, uploaded, priorReadBytes, err := ingestIntoRepo(
+	result, uploaded, priorReadBytes, zeroFilledBlocks, err := ingestIntoRepo(
 		ctx, rep, opts, source, incremental, previousBackupName, tagMap)
 	if err != nil {
 		return err
 	}
 
-	return emitResult(result, uploaded, priorReadBytes)
+	return emitResult(result, uploaded, priorReadBytes, zeroFilledBlocks)
 }
 
 // ingestIntoRepo runs the ingest inside a write session, returning the result,
-// the number of bytes actually uploaded (for the dedup statistics), and the
-// bytes read back from the prior image during incremental reconstruction (zero
-// for a full backup or for unchanged files taken via the reuse fast path).
+// the number of bytes actually uploaded (for the dedup statistics), the bytes
+// read back from the prior image during incremental reconstruction (zero for a
+// full backup or for unchanged files taken via the reuse fast path), and the
+// count of below-truncation blocks zero-filled as uninitialized extensions.
 func ingestIntoRepo(
 	ctx context.Context,
 	rep repo.Repository,
@@ -178,11 +185,12 @@ func ingestIntoRepo(
 	incremental bool,
 	previousBackupName string,
 	tagMap map[string]string,
-) (*ingest.Result, int64, int64, error) {
+) (*ingest.Result, int64, int64, int64, error) {
 	var (
-		uploaded       atomic.Int64
-		result         *ingest.Result
-		priorReadBytes int64
+		uploaded         atomic.Int64
+		result           *ingest.Result
+		priorReadBytes   int64
+		zeroFilledBlocks int64
 	)
 
 	writeErr := repo.WriteSession(ctx, rep, repo.WriteSessionOptions{
@@ -203,15 +211,16 @@ func ingestIntoRepo(
 		result, runErr = ingest.Run(ctx, w, os.Stdin, opts)
 		if prior != nil {
 			priorReadBytes = prior.BytesRead()
+			zeroFilledBlocks = prior.ZeroFilledBlocks()
 		}
 
 		return runErr
 	})
 	if writeErr != nil {
-		return nil, 0, 0, fmt.Errorf("while ingesting BASE_BACKUP: %w", writeErr)
+		return nil, 0, 0, 0, fmt.Errorf("while ingesting BASE_BACKUP: %w", writeErr)
 	}
 
-	return result, uploaded.Load(), priorReadBytes, nil
+	return result, uploaded.Load(), priorReadBytes, zeroFilledBlocks, nil
 }
 
 // buildPriorImage resolves the prior backup's snapshot for this same source
@@ -275,7 +284,7 @@ func buildPriorImage(
 	return ingest.NewKopiaPriorImage(ctx, rep, man.RootEntry.ObjectID), nil
 }
 
-func emitResult(result *ingest.Result, uploaded, priorReadBytes int64) error {
+func emitResult(result *ingest.Result, uploaded, priorReadBytes, zeroFilledBlocks int64) error {
 	// These byte counts are an approximation, not an exact accounting. uploaded
 	// is the number of bytes written to the blob store (post-compression,
 	// post-dedup), reported as hashedBytes; TotalSize is the logical size of the
@@ -289,12 +298,13 @@ func emitResult(result *ingest.Result, uploaded, priorReadBytes int64) error {
 		ManifestID:   result.ManifestID,
 		RootObjectID: result.RootObjectID,
 		Stats: outputStats{
-			TotalSize:      result.Stats.TotalSize,
-			HashedBytes:    uploaded,
-			CachedBytes:    cached,
-			FileCount:      result.Stats.FileCount,
-			ReusedFiles:    result.Stats.ReusedFiles,
-			PriorReadBytes: priorReadBytes,
+			TotalSize:        result.Stats.TotalSize,
+			HashedBytes:      uploaded,
+			CachedBytes:      cached,
+			FileCount:        result.Stats.FileCount,
+			ReusedFiles:      result.Stats.ReusedFiles,
+			PriorReadBytes:   priorReadBytes,
+			ZeroFilledBlocks: zeroFilledBlocks,
 		},
 	}
 

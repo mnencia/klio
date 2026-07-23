@@ -76,6 +76,13 @@ type KopiaPriorImage struct {
 	// had to pull back from the repository (zero for files taken via the
 	// metadata-only reuse path).
 	bytesRead atomic.Int64
+
+	// zeroFilledBlocks counts blocks requested past the end of a prior file
+	// object. Every such request is materialized by the combine as a zero-filled
+	// uninitialized extension block (see writePriorOrZeroBlock), so this is the
+	// number of blocks the backup manufactured rather than sourced - normally a
+	// small, steady number (e.g. pg_statistic churn); a spike is worth a look.
+	zeroFilledBlocks atomic.Int64
 }
 
 // NewKopiaPriorImage builds a prior image rooted at the given directory object.
@@ -88,6 +95,13 @@ func NewKopiaPriorImage(ctx context.Context, rep repo.Repository, rootOID object
 // contributes nothing, so this is the read-back the reuse optimization avoids.
 func (p *KopiaPriorImage) BytesRead() int64 {
 	return p.bytesRead.Load()
+}
+
+// ZeroFilledBlocks reports how many prior-image blocks were requested past the
+// end of their file object and therefore zero-filled as uninitialized extension
+// blocks during reconstruction.
+func (p *KopiaPriorImage) ZeroFilledBlocks() int64 {
+	return p.zeroFilledBlocks.Load()
 }
 
 // BlockReader implements PriorImage.
@@ -105,7 +119,8 @@ func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlock
 	}
 
 	return &objectBlockReader{
-		reader: reader, blockSize: blockSize, buf: make([]byte, blockSize), bytesRead: &p.bytesRead,
+		reader: reader, blockSize: blockSize, buf: make([]byte, blockSize),
+		bytesRead: &p.bytesRead, zeroFilled: &p.zeroFilledBlocks,
 	}, nil
 }
 
@@ -212,6 +227,10 @@ type objectBlockReader struct {
 	// bytesRead points at the owning KopiaPriorImage's counter, bumped by the
 	// block size on each successful read so the total read-back is observable.
 	bytesRead *atomic.Int64
+
+	// zeroFilled points at the owning KopiaPriorImage's counter of blocks
+	// requested past end-of-object (which the combine zero-fills).
+	zeroFilled *atomic.Int64
 }
 
 // Close releases the underlying Kopia object reader.
@@ -221,6 +240,19 @@ func (o *objectBlockReader) Close() error {
 
 func (o *objectBlockReader) ReadBlock(n uint32) ([]byte, error) {
 	offset := int64(n) * int64(o.blockSize)
+
+	// A block that is not fully present in the prior object does not exist in
+	// the prior image. Report it as io.EOF so the combiner zero-fills it as an
+	// uninitialized extension block (see writePriorOrZeroBlock). This mirrors
+	// pg_combinebackup, which sources only whole blocks below floor(len/BLCKSZ)
+	// and zero-fills the rest, so a non-block-aligned prior degrades gracefully
+	// instead of failing the backup.
+	if offset+int64(o.blockSize) > o.reader.Length() {
+		o.zeroFilled.Add(1)
+
+		return nil, io.EOF
+	}
+
 	if _, err := o.reader.Seek(offset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("while seeking prior block %d: %w", n, err)
 	}
