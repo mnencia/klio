@@ -42,10 +42,12 @@ var (
 	// start with the expected magic number.
 	ErrBadIncrementalMagic = errors.New("invalid incremental file magic")
 
-	// ErrBlockNotAvailable is returned during reconstruction when a block is
-	// neither present in the incremental file nor readable from the prior
-	// image. This is the defensive check from the design (relation extension).
-	ErrBlockNotAvailable = errors.New("block missing from both incremental and prior image")
+	// ErrBlockNotAvailable is returned during reconstruction when a block that
+	// is not in the incremental cannot be read from the prior image for a
+	// genuine reason (an I/O or decode error, not merely being past the prior's
+	// end). A block simply beyond the prior image is treated as a zero-filled
+	// uninitialized extension block, matching PostgreSQL's pg_combinebackup.
+	ErrBlockNotAvailable = errors.New("prior image block could not be read")
 
 	// ErrBlocksNotAscending is returned when the present-block array is not
 	// sorted ascending, which the single-pass reconstruction relies on.
@@ -77,9 +79,6 @@ type IncrementalHeader struct {
 	// TruncationBlockLength is the length, in blocks, that the reconstructed
 	// relation segment must have.
 	TruncationBlockLength uint32
-
-	// blockSize is the BLCKSZ used for header padding and block data.
-	blockSize int
 }
 
 // ParseIncrementalHeader reads and validates the header of an INCREMENTAL.*
@@ -108,7 +107,7 @@ func ParseIncrementalHeader(r io.Reader, blockSize int) (*IncrementalHeader, err
 		return nil, err
 	}
 
-	// Present blocks must lie strictly below the truncation length. Reconstruct
+	// Present blocks must lie strictly below the truncation length. The combine
 	// only walks output blocks in [0, truncation), so a block at or beyond it
 	// would never be read from the data section, silently corrupting the result.
 	if n := len(blockNumbers); n > 0 && blockNumbers[n-1] >= truncation {
@@ -133,7 +132,6 @@ func ParseIncrementalHeader(r io.Reader, blockSize int) (*IncrementalHeader, err
 	return &IncrementalHeader{
 		BlockNumbers:          blockNumbers,
 		TruncationBlockLength: truncation,
-		blockSize:             blockSize,
 	}, nil
 }
 
@@ -170,61 +168,29 @@ type PriorBlockReader interface {
 	io.Closer
 }
 
-// Reconstruct combines an incremental file into a full relation segment in a
-// single forward pass and writes the result to out. blockData must be
-// positioned at the first incremental block (i.e. after ParseIncrementalHeader).
-//
-// For each output block i in [0, TruncationBlockLength): if i is present in the
-// incremental file, the next block is taken from blockData (which arrives in
-// ascending order, matching the forward walk of i); otherwise the block is read
-// from prior. Identical reconstructed blocks deduplicate against the prior in
-// the repository automatically.
-func Reconstruct(
-	h *IncrementalHeader,
-	blockData io.Reader,
-	prior PriorBlockReader,
-	out io.Writer,
-) error {
-	blockSize := h.blockSize
-	if blockSize <= 0 {
-		blockSize = DefaultBlockSize
-	}
-
-	buf := make([]byte, blockSize)
-	cursor := 0 // index into h.BlockNumbers
-
-	for i := range h.TruncationBlockLength {
-		if cursor < len(h.BlockNumbers) && h.BlockNumbers[cursor] == i {
-			if _, err := io.ReadFull(blockData, buf); err != nil {
-				return fmt.Errorf("while reading incremental block %d: %w", i, err)
-			}
-			cursor++
-			if _, err := out.Write(buf); err != nil {
-				return fmt.Errorf("while writing block %d: %w", i, err)
+// writePriorOrZeroBlock writes output block i from the prior image. A block at
+// or beyond the prior image (io.EOF) is one the server extended the file to but
+// never WAL-logged (an uninitialized page); PostgreSQL's pg_combinebackup
+// materializes it as zero-filled, so match that rather than failing. Any other
+// read failure is a genuine error.
+func writePriorOrZeroBlock(prior PriorBlockReader, i uint32, zeroBlock []byte, out io.Writer) error {
+	block, err := prior.ReadBlock(i)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			if _, werr := out.Write(zeroBlock); werr != nil {
+				return fmt.Errorf("while writing zero-filled block %d: %w", i, werr)
 			}
 
-			continue
+			return nil
 		}
 
-		block, err := prior.ReadBlock(i)
-		if err != nil {
-			return fmt.Errorf("%w: block %d: %w", ErrBlockNotAvailable, i, err)
-		}
-		if _, err := out.Write(block); err != nil {
-			return fmt.Errorf("while writing prior block %d: %w", i, err)
-		}
+		return fmt.Errorf("%w: block %d: %w", ErrBlockNotAvailable, i, err)
+	}
+	if _, err := out.Write(block); err != nil {
+		return fmt.Errorf("while writing prior block %d: %w", i, err)
 	}
 
-	// Every present block must have been consumed; otherwise the data section
-	// held blocks the forward walk never reached and the output is corrupt.
-	if cursor != len(h.BlockNumbers) {
-		return fmt.Errorf("%w: consumed %d of %d present blocks",
-			ErrReconstructIncomplete, cursor, len(h.BlockNumbers))
-	}
-
-	// The data section must be fully drained; otherwise the header under-counted
-	// the blocks present in the file.
-	return assertDrained(blockData, buf[:1])
+	return nil
 }
 
 // assertDrained verifies r is at EOF, using scratch as a one-byte probe buffer.

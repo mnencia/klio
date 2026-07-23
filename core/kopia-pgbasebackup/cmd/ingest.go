@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -44,6 +45,12 @@ const (
 	backupNameTag = "klio.io/tag"
 	contentTag    = "klio.io/content"
 )
+
+// segmentMapContentSuffix is appended to a source's data content-tag value to
+// form the content tag of its segment-map snapshot (e.g. "pgdata-segmap"). A
+// distinct value keeps the segment map resolvable per source and prevents it
+// from making the data snapshot's resolution ambiguous.
+const segmentMapContentSuffix = "-segmap"
 
 // tablespacePathPrefix is the synthetic SourceInfo.Path prefix core's
 // executor.go gives every tablespace source ("/tablespace/<oid>"), used
@@ -105,6 +112,17 @@ type outputStats struct {
 	// incremental's read-back the reuse fast path avoided.
 	ReusedFiles    int64 `json:"reusedFiles"`
 	PriorReadBytes int64 `json:"priorReadBytes"`
+
+	// ZeroFilledBlocks is the number of below-truncation blocks that were
+	// present in neither the incremental nor the prior image and so were
+	// materialized as zero-filled uninitialized extension blocks. Normally
+	// small; a spike may indicate a WAL-summary anomaly worth investigating.
+	ZeroFilledBlocks int64 `json:"zeroFilledBlocks"`
+
+	// ReferencedSegments is the number of clean segments taken by reference from
+	// the prior backup (no readback), and RebuiltSegments the number rewritten.
+	ReferencedSegments int64 `json:"referencedSegments"`
+	RebuiltSegments    int64 `json:"rebuiltSegments"`
 }
 
 func runIngest(cmd *cobra.Command, _ []string) error {
@@ -141,11 +159,12 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 
 	source := snapshot.SourceInfo{Host: host, UserName: username, Path: sourcePath}
 	opts := ingest.Options{
-		Source:      source,
-		Description: "pg_basebackup ingest of " + sourcePath,
-		Tags:        tagMap,
-		Incremental: incremental,
-		BlockSize:   blockSize,
+		Source:       source,
+		Description:  "pg_basebackup ingest of " + sourcePath,
+		Tags:         tagMap,
+		Incremental:  incremental,
+		BlockSize:    blockSize,
+		SegmentBytes: ingest.DefaultSegmentBytes,
 	}
 
 	rep, err := repo.Open(ctx, configFile, viper.GetString("kopia-password"), &repo.Options{})
@@ -154,19 +173,21 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	}
 	defer rep.Close(ctx) //nolint:errcheck
 
-	result, uploaded, priorReadBytes, err := ingestIntoRepo(
-		ctx, rep, opts, source, incremental, previousBackupName, tagMap)
+	segmentBlocks := ingest.SegmentBlocksFor(ingest.DefaultSegmentBytes, blockSize)
+	result, uploaded, priorReadBytes, zeroFilledBlocks, err := ingestIntoRepo(
+		ctx, rep, opts, source, incremental, previousBackupName, tagMap, segmentBlocks)
 	if err != nil {
 		return err
 	}
 
-	return emitResult(result, uploaded, priorReadBytes)
+	return emitResult(result, uploaded, priorReadBytes, zeroFilledBlocks)
 }
 
 // ingestIntoRepo runs the ingest inside a write session, returning the result,
-// the number of bytes actually uploaded (for the dedup statistics), and the
-// bytes read back from the prior image during incremental reconstruction (zero
-// for a full backup or for unchanged files taken via the reuse fast path).
+// the number of bytes actually uploaded (for the dedup statistics), the bytes
+// read back from the prior image during incremental reconstruction (zero for a
+// full backup or for unchanged files taken via the reuse fast path), and the
+// count of below-truncation blocks zero-filled as uninitialized extensions.
 func ingestIntoRepo(
 	ctx context.Context,
 	rep repo.Repository,
@@ -175,11 +196,13 @@ func ingestIntoRepo(
 	incremental bool,
 	previousBackupName string,
 	tagMap map[string]string,
-) (*ingest.Result, int64, int64, error) {
+	segmentBlocks int,
+) (*ingest.Result, int64, int64, int64, error) {
 	var (
-		uploaded       atomic.Int64
-		result         *ingest.Result
-		priorReadBytes int64
+		uploaded         atomic.Int64
+		result           *ingest.Result
+		priorReadBytes   int64
+		zeroFilledBlocks int64
 	)
 
 	writeErr := repo.WriteSession(ctx, rep, repo.WriteSessionOptions{
@@ -189,7 +212,7 @@ func ingestIntoRepo(
 		var prior *ingest.KopiaPriorImage
 		if incremental {
 			var priorErr error
-			prior, priorErr = buildPriorImage(ctx, w, source, previousBackupName, tagMap)
+			prior, priorErr = buildPriorImage(ctx, w, source, previousBackupName, tagMap, segmentBlocks)
 			if priorErr != nil {
 				return priorErr
 			}
@@ -200,45 +223,107 @@ func ingestIntoRepo(
 		result, runErr = ingest.Run(ctx, w, os.Stdin, opts)
 		if prior != nil {
 			priorReadBytes = prior.BytesRead()
+			zeroFilledBlocks = prior.ZeroFilledBlocks()
+		}
+		if runErr != nil {
+			return runErr
 		}
 
-		return runErr
+		return saveSegmentMap(ctx, w, source, opts, result.SegmentMap)
 	})
 	if writeErr != nil {
-		return nil, 0, 0, fmt.Errorf("while ingesting BASE_BACKUP: %w", writeErr)
+		return nil, 0, 0, 0, fmt.Errorf("while ingesting BASE_BACKUP: %w", writeErr)
 	}
 
-	return result, uploaded.Load(), priorReadBytes, nil
+	return result, uploaded.Load(), priorReadBytes, zeroFilledBlocks, nil
+}
+
+// saveSegmentMap persists this backup's segment map as its own compressed,
+// tagged directory-tree snapshot, in the same write session as the data snapshot.
+// It is scoped to the same source and tagged with the backup name plus a segmap
+// content type, so it is resolved by tags and reaped with the backup like the
+// manifest. Every backup that stores segments (full, referencing incremental,
+// and rebuild-all incremental alike) writes one; a source with no files writes
+// nothing.
+func saveSegmentMap(
+	ctx context.Context, w repo.RepositoryWriter, source snapshot.SourceInfo,
+	opts ingest.Options, segMap ingest.SegmentMap,
+) error {
+	if len(segMap.Files) == 0 {
+		return nil
+	}
+
+	tags := make(map[string]string, len(opts.Tags))
+	maps.Copy(tags, opts.Tags)
+	tags[contentTag] = segmapContentValue(opts.Tags[contentTag])
+
+	if _, err := ingest.SaveSegmentMap(
+		ctx, w, source, tags, "segment map for "+source.Path, segMap,
+	); err != nil {
+		return fmt.Errorf("while saving segment map: %w", err)
+	}
+
+	return nil
+}
+
+// segmapContentValue derives a source's segment-map content-tag value from its
+// data content value (e.g. "pgdata" -> "pgdata-segmap"). See
+// segmentMapContentSuffix for why the value is distinct.
+func segmapContentValue(dataContent string) string {
+	return dataContent + segmentMapContentSuffix
 }
 
 // buildPriorImage resolves the prior backup's snapshot for this same source
-// and exposes its tree for incremental reconstruction. Resolution and use
-// happen here, in the same call, immediately before the combine runs, so
-// there is no manifest ID handed across a process boundary for a later
-// pin/unpin to invalidate.
-//
-// The filter keys only on discriminators that are stable across backups:
-// content type, backup name, and — for a tablespace — its OID, carried in
-// the (stable) source path, never the mutable tablespace-name tag (ALTER
-// TABLESPACE ... RENAME changes the name but not the OID or path). pgdata's
-// own physical path is *not* stable across backups (for example after a
-// restore-in-place), so it is deliberately left out of scope instead.
+// and exposes its tree for incremental reconstruction, then installs the prior
+// segment map so unchanged segments can be referenced. Resolution and use
+// happen here, in the same call, immediately before the combine runs, so there
+// is no manifest ID handed across a process boundary for a later pin/unpin to
+// invalidate.
 func buildPriorImage(
 	ctx context.Context, rep repo.Repository, source snapshot.SourceInfo,
-	previousBackupName string, tagMap map[string]string,
+	previousBackupName string, tagMap map[string]string, segmentBlocks int,
 ) (*ingest.KopiaPriorImage, error) {
 	if previousBackupName == "" {
 		return nil, errIncrementalRequiresPrevious
 	}
 
-	filterTags := map[string]string{backupNameTag: previousBackupName}
-	if content, ok := tagMap[contentTag]; ok {
-		filterTags[contentTag] = content
-	}
-
 	scope := snapshot.SourceInfo{Host: source.Host, UserName: source.UserName}
 	if strings.HasPrefix(source.Path, tablespacePathPrefix) {
 		scope.Path = source.Path
+	}
+
+	man, err := resolvePriorSnapshot(ctx, rep, scope, previousBackupName, tagMap[contentTag])
+	if err != nil {
+		return nil, err
+	}
+	if man.RootEntry == nil {
+		return nil, fmt.Errorf("prior snapshot %q has no root entry", previousBackupName)
+	}
+
+	prior := ingest.NewKopiaPriorImage(ctx, rep, man.RootEntry.ObjectID)
+
+	if err := installPriorSegments(
+		ctx, rep, prior, scope, previousBackupName, tagMap[contentTag], segmentBlocks,
+	); err != nil {
+		return nil, err
+	}
+
+	return prior, nil
+}
+
+// resolvePriorSnapshot finds the single prior snapshot for this source and
+// content type. The filter keys only on discriminators stable across backups:
+// content type, backup name, and — for a tablespace — its OID carried in the
+// (stable) source path, never the mutable tablespace-name tag. pgdata's own
+// physical path is not stable across backups (e.g. after a restore-in-place),
+// so it is deliberately left out of scope.
+func resolvePriorSnapshot(
+	ctx context.Context, rep repo.Repository, scope snapshot.SourceInfo,
+	previousBackupName, content string,
+) (*snapshot.Manifest, error) {
+	filterTags := map[string]string{backupNameTag: previousBackupName}
+	if content != "" {
+		filterTags[contentTag] = content
 	}
 
 	// ListSnapshotManifests filters on raw manifest labels, not Options.Tags
@@ -265,14 +350,57 @@ func buildPriorImage(
 	if err != nil {
 		return nil, fmt.Errorf("while loading prior snapshot %q: %w", previousBackupName, err)
 	}
-	if man.RootEntry == nil {
-		return nil, fmt.Errorf("prior snapshot %q has no root entry", previousBackupName)
-	}
 
-	return ingest.NewKopiaPriorImage(ctx, rep, man.RootEntry.ObjectID), nil
+	return man, nil
 }
 
-func emitResult(result *ingest.Result, uploaded, priorReadBytes int64) error {
+// installPriorSegments resolves the prior backup's segment-map snapshot for this
+// source and installs its per-file segment IDs on prior, enabling segment
+// referencing. It is a no-op — leaving the incremental to rebuild every segment
+// — when the prior recorded no segment map (a backup taken before this feature)
+// or when the prior's segment size differs from the configured one, since
+// referencing a differently-sized segment would corrupt the file.
+func installPriorSegments(
+	ctx context.Context, rep repo.Repository, prior *ingest.KopiaPriorImage,
+	scope snapshot.SourceInfo, previousBackupName, content string, segmentBlocks int,
+) error {
+	filterTags := map[string]string{
+		backupNameTag: previousBackupName,
+		contentTag:    segmapContentValue(content),
+	}
+
+	ids, err := snapshot.ListSnapshotManifests(ctx, rep, &scope, ingest.UserTagLabels(filterTags))
+	if err != nil {
+		return fmt.Errorf("while finding prior segment map %q: %w", previousBackupName, err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) > 1 {
+		return fmt.Errorf("%w: %q segment map matches %d snapshots",
+			errAmbiguousPriorSnapshot, previousBackupName, len(ids))
+	}
+
+	man, err := snapshot.LoadSnapshot(ctx, rep, ids[0])
+	if err != nil {
+		return fmt.Errorf("while loading prior segment map %q: %w", previousBackupName, err)
+	}
+	if man.RootEntry == nil {
+		return nil
+	}
+
+	priorBlocks, segs, err := ingest.LoadSegmentMap(ctx, rep, man.RootEntry.ObjectID)
+	if err != nil {
+		return err
+	}
+	if priorBlocks == segmentBlocks {
+		prior.SetSegments(segs)
+	}
+
+	return nil
+}
+
+func emitResult(result *ingest.Result, uploaded, priorReadBytes, zeroFilledBlocks int64) error {
 	// These byte counts are an approximation, not an exact accounting. uploaded
 	// is the number of bytes written to the blob store (post-compression,
 	// post-dedup), reported as hashedBytes; TotalSize is the logical size of the
@@ -286,12 +414,15 @@ func emitResult(result *ingest.Result, uploaded, priorReadBytes int64) error {
 		ManifestID:   result.ManifestID,
 		RootObjectID: result.RootObjectID,
 		Stats: outputStats{
-			TotalSize:      result.Stats.TotalSize,
-			HashedBytes:    uploaded,
-			CachedBytes:    cached,
-			FileCount:      result.Stats.FileCount,
-			ReusedFiles:    result.Stats.ReusedFiles,
-			PriorReadBytes: priorReadBytes,
+			TotalSize:          result.Stats.TotalSize,
+			HashedBytes:        uploaded,
+			CachedBytes:        cached,
+			FileCount:          result.Stats.FileCount,
+			ReusedFiles:        result.Stats.ReusedFiles,
+			PriorReadBytes:     priorReadBytes,
+			ZeroFilledBlocks:   zeroFilledBlocks,
+			ReferencedSegments: result.Stats.ReferencedSegments,
+			RebuiltSegments:    result.Stats.RebuiltSegments,
 		},
 	}
 

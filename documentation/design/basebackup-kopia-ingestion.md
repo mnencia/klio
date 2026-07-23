@@ -163,7 +163,8 @@ with status zero:
   "manifestId": "...",
   "rootObjectId": "...",
   "stats": { "totalSize": 0, "hashedBytes": 0, "cachedBytes": 0,
-             "fileCount": 0, "reusedFiles": 0, "priorReadBytes": 0 }
+             "fileCount": 0, "reusedFiles": 0, "priorReadBytes": 0,
+             "referencedSegments": 0, "rebuiltSegments": 0 }
 }
 ```
 
@@ -171,7 +172,10 @@ with status zero:
 effective. `reusedFiles` and `priorReadBytes` cover the read side of an
 incremental: how many unchanged files were referenced from the prior object
 directly (the fast path above), and how many block bytes were read back from the
-prior image to rebuild the rest. Klio logs both when it runs the helper.
+prior image to rebuild the rest. `referencedSegments` and `rebuiltSegments` show
+the same split inside changed files: storage segments taken from the prior by
+reference versus rebuilt (see combine-on-ingest). Klio logs them when it runs
+the helper.
 Progress and logs go to standard error, read line by line (this includes the
 disk-full detection). On failure the exit status is non-zero, and Klio attaches
 the last lines of standard error to the error it reports, so the real cause is
@@ -312,54 +316,92 @@ order. Two cases matter:
 
 ### Combine-on-ingest
 
-Combine-on-ingest means rebuilding the full file from an incremental at the
-moment it is ingested. For each `INCREMENTAL.*` member the helper rebuilds the
-full image in a single forward pass and feeds it straight into the object
-writer. Each output block comes either from the incremental stream (for a
-present block) or from the prior full image:
+Combine-on-ingest means producing the full file from an incremental at the
+moment it is ingested, so every backup is a complete image (see chain depth
+below). It works at *storage-segment* granularity rather than rebuilding the
+whole file every time.
+
+Every file, full or incremental, is split into a sequence of fixed-size,
+block-aligned **storage segments** (128 KB each), each written as its own
+object. The file's own object is an *indirect* (seek-table) object over those
+segments, which the helper builds directly from the segment object IDs and their
+known lengths (`buildFileObject`). That is what makes referencing cheap: an
+incremental takes an unchanged segment from the prior backup by object ID alone,
+and the file object just lists it. (To avoid clashing with PostgreSQL's own
+1 GB relation *file* segments (`.1`, `.2`, and so on, which this document calls
+relation segment files), a storage segment is Klio's internal 128 KB unit.)
+
+The helper builds the seek-table itself rather than calling Kopia's
+`ConcatenateObjects`, because `ConcatenateObjects` opens every input segment to
+rediscover its length (compression and padding hide it), which on the Kopia
+server path re-reads the whole backup's data. The helper already knows each
+segment's length at write time, so it writes the seek-table with no read-back.
+
+For each `INCREMENTAL.*` member the helper classifies each storage segment by
+whether it holds a present (changed) block, then references the clean ones and
+rebuilds the dirty ones:
 
 ```
-open prior file P = prior snapshot's <path> (INCREMENTAL. prefix stripped)
-cursor = 0                               # into the ascending present[] array
-for i in 0 .. truncation_block_length-1:
-    if cursor < nblocks and present[cursor] == i:
-        block = next BLCKSZ from the incremental stream   # forward
-        cursor++
+S = storage-segment size in blocks (128 KB / BLCKSZ)
+for each segment covering blocks [k·S, (k+1)·S):
+    if the segment has no present block:
+        take the prior backup's segment k by reference     # no readback
     else:
-        block = P.read_block(i)                           # prior full image
-    object_writer.write(block)
+        rebuild it block by block, as a full backup would:
+            present block -> next BLCKSZ from the incremental stream (forward)
+            absent  block -> prior image block (read back)
+concatenate the segments (referenced and rebuilt) into the file object
 ```
 
-The incremental data arrives in ascending block order, which matches the forward
-walk of `i`, and the prior reads are at increasing offsets. Identical rebuilt
-blocks deduplicate against the prior on their own. So the new repository storage
-is roughly the changed blocks, while PostgreSQL only read and shipped the
-changed blocks.
-
-A file with no present blocks whose length still matches the prior takes a
-metadata-only fast path: rebuilding it would read every block back only to
-produce an object byte-identical to the prior, so the helper references the
-prior object directly instead. No blocks are read, and nothing is hashed again.
-Block-level reconstruction plus deduplication would converge on that same
-object, so the reference graph (and the depth-1 invariant below) is unchanged;
-the fast path only avoids the read-back. In a typical incremental the unchanged
-files are the bulk of the data, so this avoids most of the repository reads a
-rebuild would otherwise incur. A file that shrank (a shorter truncation) is a
-genuine prefix of the prior and still goes through the rebuild above. The helper
-reports how many files it reused and how many prior bytes it read back (see the
-`reusedFiles` and `priorReadBytes` stats).
+So the read-back shrinks from *every* unchanged block of a changed file to only
+the unchanged blocks inside its dirty segments; a change confined to part of a
+large relation touches only the segments around it. Identical rebuilt blocks
+still deduplicate against the prior on their own. A file with no present blocks
+whose length matches the prior skips this entirely and takes the whole-file
+fast path: the helper references the prior object directly, reading and hashing
+nothing. A file whose every segment is dirty degrades to the old full-file
+rebuild, never worse. A file that shrank (a shorter truncation) is a genuine
+prefix of the prior and is rebuilt. The helper reports the split as the
+`reusedFiles`, `priorReadBytes`, `referencedSegments`, and `rebuiltSegments`
+stats.
 
 The rebuild is strict. It checks that every present block is consumed and that
 the incremental stream ends exactly where expected. It also resolves the prior
 tree with type checks: each intermediate path component must be a directory, and
 the leaf must be a regular file. A malformed input therefore fails with an error
-instead of producing a corrupt segment.
+instead of producing a corrupt object.
+
+### The segment map
+
+An incremental needs the prior backup's per-file segment object IDs and the
+segment size they were written at. It resolves these from a **segment map**: a
+compressed directory-tree snapshot each backup writes, scoped and tagged like
+the source's data snapshot (`content=<source>-segmap`, plus the backup name), so
+it is resolved by tag and reaped with the backup like the `backup_manifest`. The
+root holds the segment size plus one subdirectory per file, whose entries are
+that file's storage segments in order.
+
+The map is stored as a tree, not a flat list of IDs, so it stays compact (the
+manifests compress well and each object ID appears once) and self-describing.
+The tree entries also keep the segment objects garbage-collection-reachable, but
+that is redundant: `buildFileObject` references each segment object directly (it
+does not flatten their indexes), so the data snapshot's file object already
+keeps every referenced segment reachable, including a multi-content segment's
+seek-table. The map's job is the mapping, not GC-rescue.
+
+The map is **self-describing**: it records the segment size, so an incremental
+references prior segments only when that size matches the one configured now.
+Otherwise it references nothing and rebuilds every segment at the current size,
+a byte-correct full rebuild rather than a spliced mismatch, and references
+re-enable on the next backup. The size is fixed at 128 KB and not
+user-configurable: it balances scattered-change repository growth (smaller is
+better) against object and index count (larger is better).
 
 ### One full image per backup (chain depth 1)
 
-The single-pass rebuild works only because combine-on-ingest produces a full
-image on every backup. The prior is therefore always a single complete file, and
-the chain depth at ingest is always exactly one. Klio never stores a raw
+Combine-on-ingest produces a full image on every backup, whether it referenced
+prior segments or rebuilt them. The prior is therefore always a single complete
+file, and the chain depth at ingest is exactly one. Klio never stores a raw
 incremental chain in Kopia: each incremental is combined at ingest against the
 immediately-prior full image, read from the repository that the helper already
 has open. A restore is the same as for a full backup: one full snapshot, with no
@@ -367,7 +409,7 @@ has open. A restore is the same as for a full backup: one full snapshot, with no
 chains, which this design never creates.)
 
 This depth-1 property is a hard invariant, not just a convenience. Three parts
-of the system rely on it: reconstruction (the single forward pass assumes the
+of the system rely on it: reconstruction (rebuilding a dirty segment assumes the
 prior is one complete file), restore (it treats every snapshot as a full backup
 and never runs `pg_combinebackup`), and retention (any backup can be deleted
 because each snapshot stands alone). Do not introduce stored incremental chains:
@@ -375,14 +417,17 @@ that would break all three at once.
 
 ### Edge cases
 
-- Relation extension: new blocks are always present in the incremental, by
-  construction. A block that is neither present nor available from the prior is
-  a defensive error.
+- Relation extension: a block below the truncation length that is present in
+  neither the incremental nor the prior image is one PostgreSQL extended the
+  file to but never WAL-logged (an uninitialized page). It is reconstructed as
+  a zero-filled block, matching PostgreSQL's `pg_combinebackup`, and counted in
+  the ingest stats (`zeroFilledBlocks`). See Limitations. A block that cannot be
+  read from the prior for a genuine reason (an I/O error) is still a hard error.
 - Relation truncation: the rebuild stops at the truncation block length and does
   not copy prior blocks beyond it.
-- Segmented relations (larger than 1 GB, split into `.1`, `.2`, and so on): each
-  segment is an independent tar member with its own header, handled by the same
-  loop with no state shared across segments.
+- Relation segment files (a relation larger than 1 GB, split into `.1`, `.2`,
+  and so on): each is an independent tar member with its own header, split into
+  storage segments and combined on its own, with no state shared across files.
 
 ### Selecting the prior backup
 
@@ -444,6 +489,10 @@ covering the backup is present.
 - The `backup_manifest` is stored as a single-file snapshot (`content=manifest`,
   tagged with the backup name), next to the metadata snapshot and pinned with
   it. Retention treats it like the metadata.
+- Each source's segment map is stored as a compressed directory-tree snapshot
+  (`content=<source>-segmap`, tagged with the backup name) and reaped with the
+  backup like the manifest. It records that source's per-file storage-segment
+  object IDs and keeps them GC-reachable (see "The segment map").
 - No per-source Kopia identifier is recorded in the backup metadata. The
   incremental combine base is identified by backup name only and resolved
   live by the helper at combine time (see "Selecting the prior backup").
@@ -474,6 +523,18 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
 - A full backup over the stream gives up Kopia's skip of unchanged files. That
   is a CPU cost only, not a transfer or storage cost, and incremental backup
   avoids it.
+- Files are stored as fixed 128 KB storage segments, and the size is not
+  configurable. An incremental rebuilds every segment that contains a changed
+  block, so a change scattered uniformly across a relation grows the repository
+  by roughly the touched segments rather than the logical change size; a
+  localized change is far cheaper.
+- Incremental reconstruction, like PostgreSQL's `pg_combinebackup`, cannot
+  distinguish a genuinely uninitialized (all-zero) extension page from one whose
+  modification the WAL summaries failed to record. A below-truncation block
+  present in neither the incremental nor the prior image is assumed
+  uninitialized and materialized as zeros; WAL replay reinitializes such pages
+  on recovery. The `zeroFilledBlocks` ingest stat surfaces how often this
+  happens so an anomaly is visible rather than silent.
 
 ## Code map
 
@@ -485,7 +546,7 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
 - Helper invocation from `klio`: `core/internal/kopia/pgbasebackup.go` and
   `core/internal/client/klioclient/kopia/pgbasebackup.go`.
 - Ingestion helper (separate module): `core/kopia-pgbasebackup/` (`main.go`,
-  `internal/ingest/{ingest,incremental,prior}.go`).
+  `internal/ingest/{ingest,incremental,prior,segmap}.go`).
 - Restore (self-contained-tree handling):
   `core/internal/client/klioclient/restore.go`.
 - Operator configuration surface:

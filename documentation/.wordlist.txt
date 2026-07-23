@@ -337,8 +337,10 @@ provisioner
 pullPolicy
 pullSecrets
 quickstart
+reachability
 readinessProbe
 recompressed
+reinitializes
 renewBefore
 restorable
 rollout
@@ -350,6 +352,7 @@ sfixed
 sint
 snapshotted
 snapshotting
+splitter
 stderr
 str
 subdirectories

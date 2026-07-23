@@ -76,6 +76,19 @@ type KopiaPriorImage struct {
 	// had to pull back from the repository (zero for files taken via the
 	// metadata-only reuse path).
 	bytesRead atomic.Int64
+
+	// zeroFilledBlocks counts blocks requested past the end of a prior file
+	// object. Every such request is materialized by the combine as a zero-filled
+	// uninitialized extension block (see writePriorOrZeroBlock), so this is the
+	// number of blocks the backup manufactured rather than sourced - normally a
+	// small, steady number (e.g. pg_statistic churn); a spike is worth a look.
+	zeroFilledBlocks atomic.Int64
+
+	// priorSegments maps a file's logical path to its ordered segment object IDs
+	// from the prior backup, so an incremental can reference an unchanged
+	// segment by object ID instead of reading its blocks back. Nil when the
+	// prior backup recorded no segment map.
+	priorSegments map[string][]object.ID
 }
 
 // NewKopiaPriorImage builds a prior image rooted at the given directory object.
@@ -88,6 +101,13 @@ func NewKopiaPriorImage(ctx context.Context, rep repo.Repository, rootOID object
 // contributes nothing, so this is the read-back the reuse optimization avoids.
 func (p *KopiaPriorImage) BytesRead() int64 {
 	return p.bytesRead.Load()
+}
+
+// ZeroFilledBlocks reports how many prior-image blocks were requested past the
+// end of their file object and therefore zero-filled as uninitialized extension
+// blocks during reconstruction.
+func (p *KopiaPriorImage) ZeroFilledBlocks() int64 {
+	return p.zeroFilledBlocks.Load()
 }
 
 // BlockReader implements PriorImage.
@@ -105,7 +125,8 @@ func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlock
 	}
 
 	return &objectBlockReader{
-		reader: reader, blockSize: blockSize, buf: make([]byte, blockSize), bytesRead: &p.bytesRead,
+		reader: reader, blockSize: blockSize, buf: make([]byte, blockSize),
+		bytesRead: &p.bytesRead, zeroFilled: &p.zeroFilledBlocks,
 	}, nil
 }
 
@@ -114,6 +135,24 @@ func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlock
 // object directly without reading its blocks.
 func (p *KopiaPriorImage) Entry(relPath string) (*snapshot.DirEntry, error) {
 	return p.resolveEntry(relPath)
+}
+
+// SetSegments installs the prior backup's per-file segment object IDs so an
+// incremental can reference an unchanged segment by object ID.
+func (p *KopiaPriorImage) SetSegments(segments map[string][]object.ID) {
+	p.priorSegments = segments
+}
+
+// Segments implements PriorImage: it returns the prior backup's ordered segment
+// object IDs for relPath, or ok=false when the prior recorded no segment map.
+func (p *KopiaPriorImage) Segments(relPath string) ([]object.ID, bool) {
+	if p.priorSegments == nil {
+		return nil, false
+	}
+	clean := path.Clean(strings.TrimPrefix(relPath, "./"))
+	segs, ok := p.priorSegments[clean]
+
+	return segs, ok
 }
 
 // resolveEntry walks the directory tree to find the file entry for relPath.
@@ -203,15 +242,19 @@ type objectBlockReader struct {
 	blockSize int
 
 	// buf is reused across ReadBlock calls instead of allocating a fresh
-	// blockSize buffer each time. Safe: the caller (Reconstruct) writes out
+	// blockSize buffer each time. Safe: the caller (rebuildSegment) writes out
 	// each returned block immediately and never retains it, and one
 	// objectBlockReader is only ever driven synchronously from a single
-	// Reconstruct call for one file.
+	// combine for one file.
 	buf []byte
 
 	// bytesRead points at the owning KopiaPriorImage's counter, bumped by the
 	// block size on each successful read so the total read-back is observable.
 	bytesRead *atomic.Int64
+
+	// zeroFilled points at the owning KopiaPriorImage's counter of blocks
+	// requested past end-of-object (which the combine zero-fills).
+	zeroFilled *atomic.Int64
 }
 
 // Close releases the underlying Kopia object reader.
@@ -221,6 +264,19 @@ func (o *objectBlockReader) Close() error {
 
 func (o *objectBlockReader) ReadBlock(n uint32) ([]byte, error) {
 	offset := int64(n) * int64(o.blockSize)
+
+	// A block that is not fully present in the prior object does not exist in
+	// the prior image. Report it as io.EOF so the combiner zero-fills it as an
+	// uninitialized extension block (see writePriorOrZeroBlock). This mirrors
+	// pg_combinebackup, which sources only whole blocks below floor(len/BLCKSZ)
+	// and zero-fills the rest, so a non-block-aligned prior degrades gracefully
+	// instead of failing the backup.
+	if offset+int64(o.blockSize) > o.reader.Length() {
+		o.zeroFilled.Add(1)
+
+		return nil, io.EOF
+	}
+
 	if _, err := o.reader.Seek(offset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("while seeking prior block %d: %w", n, err)
 	}

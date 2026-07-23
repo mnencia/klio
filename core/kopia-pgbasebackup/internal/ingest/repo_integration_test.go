@@ -33,6 +33,7 @@ import (
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/blob/filesystem"
 	"github.com/kopia/kopia/repo/manifest"
+	"github.com/kopia/kopia/repo/object"
 	"github.com/kopia/kopia/snapshot"
 	"github.com/kopia/kopia/snapshot/restore"
 	"github.com/kopia/kopia/snapshot/snapshotfs"
@@ -463,6 +464,10 @@ func (r *recordingPrior) Entry(relPath string) (*snapshot.DirEntry, error) {
 	return r.inner.Entry(relPath)
 }
 
+func (r *recordingPrior) Segments(relPath string) ([]object.ID, bool) {
+	return r.inner.Segments(relPath)
+}
+
 // fileObjectID resolves the object ID of the file at relPath in a snapshot.
 func fileObjectID(ctx context.Context, t *testing.T, configFile, manifestID, relPath string) string {
 	t.Helper()
@@ -542,6 +547,312 @@ func TestIncrementalUnchangedFileReusesPriorObject(t *testing.T) {
 		fileObjectID(ctx, t, configFile, inc.ManifestID, "base/1/1259"); prior != got {
 		t.Fatalf("object id not reused: prior %s, new %s", prior, got)
 	}
+}
+
+// TestIncrementalExtendedFileZeroFillsUninitializedBlock is the regression test
+// for the field failure on base/16385/2619 (pg_statistic): a relation grew
+// since the prior backup, but its trailing block was extended without being
+// WAL-logged, so the incremental omits it (below truncation) and the prior
+// image is shorter. Reconstruction must zero-fill that block, matching
+// PostgreSQL's pg_combinebackup, rather than failing the backup.
+func TestIncrementalExtendedFileZeroFillsUninitializedBlock(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+	modTime := time.Unix(1_700_000_000, 0)
+
+	// Full backup: a 2-block relation.
+	fullRelation := bytes.Join([][]byte{priorBlock(0), priorBlock(1)}, nil)
+	fullTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/1259", typeflag: tar.TypeReg, mode: 0o600, data: fullRelation, modTime: modTime},
+	})
+	full := ingestTar(ctx, t, configFile, fullTar,
+		Options{Source: defaultSource(), BlockSize: testBlockSize}, nil)
+
+	// Incremental: the file grew to 3 blocks with no WAL-logged change (zero
+	// present blocks, truncation 3). Block 2 lies beyond the 2-block prior.
+	incMember := buildIncrementalFile(t, 3, nil)
+	incTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/INCREMENTAL.1259", typeflag: tar.TypeReg, mode: 0o600, data: incMember, modTime: modTime},
+	})
+	inc := ingestTar(ctx, t, configFile, incTar,
+		Options{Source: defaultSource(), Incremental: true, BlockSize: testBlockSize},
+		func(w repo.RepositoryWriter, opts *Options) {
+			priorMan, err := snapshot.LoadSnapshot(ctx, w, manifest.ID(full.ManifestID))
+			if err != nil {
+				t.Fatalf("load prior snapshot: %v", err)
+			}
+			opts.Prior = NewKopiaPriorImage(ctx, w, priorMan.RootEntry.ObjectID)
+		})
+
+	out := filepath.Join(t.TempDir(), "restored")
+	restoreSnapshot(ctx, t, configFile, inc.ManifestID, out)
+
+	want := bytes.Join([][]byte{
+		priorBlock(0),
+		priorBlock(1),
+		make([]byte, testBlockSize), // block 2: uninitialized extension, zero-filled
+	}, nil)
+	assertFileEqual(t, filepath.Join(out, "base/1/1259"), want)
+}
+
+// TestIncrementalSegmentReference verifies the segment-reference combine: clean
+// segments are referenced from the prior (counted, not rebuilt) and dirty ones
+// rebuilt, and the restore is byte-exact across the tricky cases (a partial
+// last segment, a grown file, and a shrunk file).
+func TestIncrementalSegmentReference(t *testing.T) {
+	const segBytes = 2 * testBlockSize // two blocks per segment
+
+	cases := []struct {
+		name        string
+		fullBlocks  uint32
+		truncation  uint32
+		present     []uint32
+		wantRef     int64
+		wantRebuilt int64
+	}{
+		{
+			name:       "single block change references clean segments",
+			fullBlocks: 8, truncation: 8, present: []uint32{5}, wantRef: 3, wantRebuilt: 1,
+		},
+		{
+			name:       "partial last segment",
+			fullBlocks: 5, truncation: 5, present: []uint32{0}, wantRef: 2, wantRebuilt: 1,
+		},
+		{
+			name:       "grown file adds a new segment",
+			fullBlocks: 4, truncation: 6, present: []uint32{4, 5}, wantRef: 2, wantRebuilt: 1,
+		},
+		{
+			name:       "shrunk file drops trailing segments",
+			fullBlocks: 6, truncation: 3, present: nil, wantRef: 1, wantRebuilt: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			configFile := newRepo(ctx, t)
+			modTime := time.Unix(1_700_000_000, 0)
+
+			blocks := make([][]byte, tc.fullBlocks)
+			for i := range blocks {
+				blocks[i] = priorBlock(uint32(i))
+			}
+			fullTar := buildTar(t, []tarEntry{
+				{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+				{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+				{name: "base/1/1259", typeflag: tar.TypeReg, mode: 0o600, data: bytes.Join(blocks, nil), modTime: modTime},
+			})
+			full := ingestTar(ctx, t, configFile, fullTar,
+				Options{Source: defaultSource(), BlockSize: testBlockSize, SegmentBytes: segBytes}, nil)
+
+			incMember := buildIncrementalFile(t, tc.truncation, tc.present)
+			incTar := buildTar(t, []tarEntry{
+				{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+				{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+				{name: "base/1/INCREMENTAL.1259", typeflag: tar.TypeReg, mode: 0o600, data: incMember, modTime: modTime},
+			})
+			inc := ingestTar(ctx, t, configFile, incTar,
+				Options{Source: defaultSource(), Incremental: true, BlockSize: testBlockSize, SegmentBytes: segBytes},
+				func(w repo.RepositoryWriter, opts *Options) {
+					priorMan, err := snapshot.LoadSnapshot(ctx, w, manifest.ID(full.ManifestID))
+					if err != nil {
+						t.Fatalf("load prior snapshot: %v", err)
+					}
+					prior := NewKopiaPriorImage(ctx, w, priorMan.RootEntry.ObjectID)
+					prior.SetSegments(parseSegmentMap(t, full.SegmentMap.Files))
+					opts.Prior = prior
+				})
+
+			if inc.Stats.ReferencedSegments != tc.wantRef || inc.Stats.RebuiltSegments != tc.wantRebuilt {
+				t.Fatalf("segments referenced=%d rebuilt=%d, want referenced=%d rebuilt=%d",
+					inc.Stats.ReferencedSegments, inc.Stats.RebuiltSegments, tc.wantRef, tc.wantRebuilt)
+			}
+
+			out := filepath.Join(t.TempDir(), "restored")
+			restoreSnapshot(ctx, t, configFile, inc.ManifestID, out)
+			assertFileEqual(t, filepath.Join(out, "base/1/1259"), expectedRelation(tc.truncation, tc.present))
+		})
+	}
+}
+
+// TestIncrementalCarriedWholeFileNotReferenced is the regression test for the
+// segment-map poisoning bug. When an incremental takes an unchanged
+// multi-segment file via the whole-file reuse path while the prior segment map
+// is NOT installed (a legacy prior, or a mid-chain segment-size change), the
+// file must not be recorded as a single whole-file "segment": doing so made the
+// next size-matching incremental splice the entire file into the segment-0 slot
+// and silently corrupt the restore. gen1 reuses an unchanged 5-block (3-segment)
+// file with no prior segments installed; gen2 then changes one block using
+// gen1's map. The restore must be byte-exact.
+func TestIncrementalCarriedWholeFileNotReferenced(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+	modTime := time.Unix(1_700_000_000, 0)
+	const segBytes = 2 * testBlockSize // 2 blocks/segment; a 5-block file is 3 segments
+
+	dirEntries := func(member tarEntry) []tarEntry {
+		return []tarEntry{
+			{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+			{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+			member,
+		}
+	}
+	blocks := make([][]byte, 5)
+	for i := range blocks {
+		blocks[i] = priorBlock(uint32(i))
+	}
+
+	full := ingestTar(ctx, t, configFile, buildTar(t, dirEntries(tarEntry{
+		name: "base/1/1259", typeflag: tar.TypeReg, mode: 0o600, data: bytes.Join(blocks, nil), modTime: modTime,
+	})), Options{Source: defaultSource(), BlockSize: testBlockSize, SegmentBytes: segBytes}, nil)
+
+	// gen1: file UNCHANGED, prior segment map deliberately NOT installed (mimics
+	// a legacy prior / uninstalled map), so the reuse path runs carryPriorSegments
+	// with ok=false.
+	gen1 := ingestTar(ctx, t, configFile, buildTar(t, dirEntries(tarEntry{
+		name: "base/1/INCREMENTAL.1259", typeflag: tar.TypeReg, mode: 0o600,
+		data: buildIncrementalFile(t, 5, nil), modTime: modTime,
+	})), Options{Source: defaultSource(), Incremental: true, BlockSize: testBlockSize, SegmentBytes: segBytes},
+		func(w repo.RepositoryWriter, opts *Options) {
+			priorMan, err := snapshot.LoadSnapshot(ctx, w, manifest.ID(full.ManifestID))
+			if err != nil {
+				t.Fatalf("load gen0 snapshot: %v", err)
+			}
+			opts.Prior = NewKopiaPriorImage(ctx, w, priorMan.RootEntry.ObjectID) // no SetSegments
+		})
+
+	// gen2: change block 4 (leaves segment 0 clean), install gen1's map.
+	gen2 := ingestTar(ctx, t, configFile, buildTar(t, dirEntries(tarEntry{
+		name: "base/1/INCREMENTAL.1259", typeflag: tar.TypeReg, mode: 0o600,
+		data: buildIncrementalFile(t, 5, []uint32{4}), modTime: modTime,
+	})), Options{Source: defaultSource(), Incremental: true, BlockSize: testBlockSize, SegmentBytes: segBytes},
+		func(w repo.RepositoryWriter, opts *Options) {
+			priorMan, err := snapshot.LoadSnapshot(ctx, w, manifest.ID(gen1.ManifestID))
+			if err != nil {
+				t.Fatalf("load gen1 snapshot: %v", err)
+			}
+			prior := NewKopiaPriorImage(ctx, w, priorMan.RootEntry.ObjectID)
+			prior.SetSegments(parseSegmentMap(t, gen1.SegmentMap.Files))
+			opts.Prior = prior
+		})
+
+	out := filepath.Join(t.TempDir(), "restored")
+	restoreSnapshot(ctx, t, configFile, gen2.ManifestID, out)
+	assertFileEqual(t, filepath.Join(out, "base/1/1259"), expectedRelation(5, []uint32{4}))
+}
+
+// TestSegmentMapSnapshotRoundTrip proves a persisted segment map snapshot loads
+// back with its segment size and per-file object IDs intact, through the
+// compressed directory-tree encoding.
+//
+//nolint:cyclop // a linear save/load round-trip plus its verification loops
+func TestSegmentMapSnapshotRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+	modTime := time.Unix(1_700_000_000, 0)
+
+	blocks := make([][]byte, 5)
+	for i := range blocks {
+		blocks[i] = priorBlock(uint32(i))
+	}
+	fullTar := buildTar(t, []tarEntry{
+		{name: "base", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1", typeflag: tar.TypeDir, mode: 0o700, modTime: modTime},
+		{name: "base/1/1259", typeflag: tar.TypeReg, mode: 0o600, data: bytes.Join(blocks, nil), modTime: modTime},
+	})
+	full := ingestTar(ctx, t, configFile, fullTar,
+		Options{Source: defaultSource(), BlockSize: testBlockSize, SegmentBytes: 2 * testBlockSize}, nil)
+	if len(full.SegmentMap.Files) == 0 {
+		t.Fatal("full backup recorded no segment map")
+	}
+
+	rep, err := repo.Open(ctx, configFile, testPassword, &repo.Options{})
+	if err != nil {
+		t.Fatalf("open repo: %v", err)
+	}
+	defer rep.Close(ctx) //nolint:errcheck
+
+	var manID string
+	if werr := repo.WriteSession(ctx, rep, repo.WriteSessionOptions{Purpose: "test"},
+		func(ctx context.Context, w repo.RepositoryWriter) error {
+			id, serr := SaveSegmentMap(ctx, w, defaultSource(),
+				map[string]string{"klio.io/tag": "backup-1", "klio.io/content": "pgdata-segmap"},
+				"segment map", full.SegmentMap)
+			manID = id
+
+			return serr
+		}); werr != nil {
+		t.Fatalf("save segment map: %v", werr)
+	}
+
+	man, err := snapshot.LoadSnapshot(ctx, rep, manifest.ID(manID))
+	if err != nil {
+		t.Fatalf("load segmap snapshot: %v", err)
+	}
+	gotBlocks, gotSegs, err := LoadSegmentMap(ctx, rep, man.RootEntry.ObjectID)
+	if err != nil {
+		t.Fatalf("load segment map: %v", err)
+	}
+	if gotBlocks != full.SegmentMap.SegmentBlocks {
+		t.Fatalf("segmentBlocks = %d, want %d", gotBlocks, full.SegmentMap.SegmentBlocks)
+	}
+	if len(gotSegs) != len(full.SegmentMap.Files) {
+		t.Fatalf("loaded %d files, want %d", len(gotSegs), len(full.SegmentMap.Files))
+	}
+	for p, want := range full.SegmentMap.Files {
+		got := gotSegs[p]
+		if len(got) != len(want) {
+			t.Fatalf("file %q: %d segments, want %d", p, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].String() != want[i] {
+				t.Fatalf("file %q segment %d = %s, want %s", p, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// parseSegmentMap converts a serialized segment map back into object IDs.
+func parseSegmentMap(t *testing.T, m map[string][]string) map[string][]object.ID {
+	t.Helper()
+	out := make(map[string][]object.ID, len(m))
+	for p, ids := range m {
+		parsed := make([]object.ID, len(ids))
+		for i, s := range ids {
+			id, err := object.ParseID(s)
+			if err != nil {
+				t.Fatalf("parse object id %q: %v", s, err)
+			}
+			parsed[i] = id
+		}
+		out[p] = parsed
+	}
+
+	return out
+}
+
+// expectedRelation reconstructs the ground-truth relation for an incremental:
+// block i is the changed block when present, otherwise the prior block.
+func expectedRelation(truncation uint32, present []uint32) []byte {
+	presentSet := make(map[uint32]bool, len(present))
+	for _, p := range present {
+		presentSet[p] = true
+	}
+	var buf bytes.Buffer
+	for i := range truncation {
+		if presentSet[i] {
+			buf.Write(presentBlock(i))
+		} else {
+			buf.Write(priorBlock(i))
+		}
+	}
+
+	return buf.Bytes()
 }
 
 // ingestTarErr runs an ingest and returns the run error (nil on success) instead
