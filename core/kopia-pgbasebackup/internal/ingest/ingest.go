@@ -41,9 +41,11 @@ import (
 
 	"github.com/kopia/kopia/fs"
 	"github.com/kopia/kopia/repo"
+	"github.com/kopia/kopia/repo/compression"
 	"github.com/kopia/kopia/repo/content"
 	"github.com/kopia/kopia/repo/object"
 	"github.com/kopia/kopia/snapshot"
+	"github.com/kopia/kopia/snapshot/policy"
 	"github.com/kopia/kopia/snapshot/snapshotfs"
 )
 
@@ -175,6 +177,10 @@ type assembler struct {
 	// segMap records this backup's per-file ordered segment object IDs, carried
 	// forward so the next incremental can reference unchanged segments.
 	segMap map[string][]object.ID
+	// compressor is the compression applied to segment data, resolved once from
+	// the repository's effective policy for the source (see resolveCompressor).
+	// Empty means no compression.
+	compressor compression.Name
 }
 
 // segRef is a segment object together with the logical byte length it
@@ -227,6 +233,7 @@ func Run(ctx context.Context, rep repo.RepositoryWriter, tarStream io.Reader, op
 		dirs:          map[string]*dirNode{},
 		segmentBlocks: segmentBlocks,
 		segMap:        map[string][]object.ID{},
+		compressor:    resolveCompressor(ctx, rep, opts.Source),
 	}
 	// The data directory root is not a tar member, so default it to the mode
 	// PostgreSQL uses for PGDATA.
@@ -565,10 +572,24 @@ func (a *assembler) writeSegmentedFile(
 	return a.fileEntry(hdr, logical, oid, written), logical, nil
 }
 
+// resolveCompressor returns the compressor the repository's effective policy
+// selects for source, so segment data is compressed exactly as Kopia's own CLI
+// snapshotter would be by `kopia policy set --compression`. One global policy
+// therefore governs both the filesystem path and this helper. An empty name (no
+// policy, or none resolvable) means no compression, matching the prior default.
+func resolveCompressor(ctx context.Context, rep repo.Repository, source snapshot.SourceInfo) compression.Name {
+	pol, _, _, err := policy.GetEffectivePolicy(ctx, rep, source)
+	if err != nil {
+		return ""
+	}
+
+	return pol.CompressionPolicy.CompressorName
+}
+
 // writeSegment writes up to limit bytes from content into a new object,
 // returning its ID and the number of bytes written (0 at end of content).
 func (a *assembler) writeSegment(content io.Reader, limit int64, logical string) (object.ID, int64, error) {
-	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + logical})
+	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + logical, Compressor: a.compressor})
 	defer writer.Close() //nolint:errcheck
 
 	n, err := io.CopyN(writer, content, limit)
@@ -832,7 +853,7 @@ func (a *assembler) rebuildSegment(
 	blockData io.Reader, h *IncrementalHeader, cursor *int, start, end int, buf, zeroBlock []byte,
 	ensureReader func() (PriorBlockReader, error), relPath string,
 ) (object.ID, error) {
-	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + relPath})
+	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + relPath, Compressor: a.compressor})
 	defer writer.Close() //nolint:errcheck
 
 	for i := start; i < end; i++ {
