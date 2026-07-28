@@ -224,10 +224,13 @@ snapshot from the Kopia library's lower-level building blocks instead of its
 high-level uploader. The uploader needs a filesystem it can read in parallel and
 seek within, so it cannot read from a one-way pipe.
 
-1. Each file member is streamed through a content-addressed object writer (which
-   deduplicates blocks on its own). This yields an object ID and a directory
-   entry that carries the metadata from the tar header (name, type, size, mode,
-   modification time, and ownership).
+1. Each file member is cut into fixed-size storage segments, each streamed
+   through its own content-addressed object writer (which deduplicates blocks on
+   its own), and the file's object is a seek table over those segments (see
+   [Combine-on-ingest](#combine-on-ingest), which is why files are stored this
+   way). This yields an object ID and a directory entry carrying the metadata
+   from the tar header (name, type, size, mode, modification time, and
+   ownership).
 1. Each entry is added to a per-directory builder, held in a map keyed by
    directory path. Parent directories are created on demand, so a member can
    arrive before its own directory member.
@@ -241,8 +244,54 @@ members in any order, including `pg_basebackup` sending `global/pg_control`
 last. An explicit directory member overrides the defaults of a directory that
 was created on demand.
 
-Files are ingested one at a time, but each large file is still uploaded in
-parallel chunks, so most of the work on big relation segments stays parallel.
+The tar stream is read by a single goroutine, in order, but the storage segments
+it cuts the stream into are written to the repository by a pool of writers (16
+by default). That is not a CPU optimization.
+Writing a segment through the Kopia repository server is latency-bound: the
+client hashes the segment locally, then blocks on a synchronous existence check
+(the server's deduplication pre-check, which the Kopia gRPC client performs for
+every write of 50 KB or more) before streaming the write itself asynchronously.
+At 128 KB segments that round trip dominates the per-segment cost, and on a full
+backup it seldom hits, since the data was just hashed for the first time. So a
+sequential writer spends most of a backup waiting, and overlapping the writes
+hides it: measured against a real Kopia server, a 2 GiB stream went from 14.3 s
+with one writer to 5.3 s with 16 (147 to 383 MiB/s), the latter being what that
+repository sustains with multi-megabyte objects. The useful concurrency is
+therefore set by the round-trip time rather than by the core count.
+
+A segment rebuilt from an `INCREMENTAL.*` member goes through the same pool. It
+is assembled in a pool buffer on the reader goroutine, because its two sources
+have to be read in order (the changed blocks from the tar stream, the unchanged
+ones from the prior image through a single seeking reader), and only the write
+is handed off. That still removes one of the two round trips a rebuilt segment
+pays, overlapping its write with the next segment's reads: 2000 rebuilt segments
+went from 4.9 s to 3.4 s, a saving of 0.76 ms each. Overlapping the prior-image
+reads too would need a reader per worker, which is not done (see
+[Limitations](#limitations)).
+
+The reader also does not stop at a file boundary. Waiting there would drain the
+pipeline once per file and cap the useful concurrency at the number of segments
+one file happens to have: a 256 KB relation is two segments, so waiting for it
+means two writes in flight instead of sixteen. Instead a file whose bytes have
+all been handed off is queued, and the reader resolves that queue between
+members, taking the ones whose segments have landed. Resolving a file is what
+writes its seek table, counts it, and files its directory entry.
+
+This is safe because a directory is only built at end of stream, and Kopia sorts
+a directory's entries when it builds the manifest, so a file resolved after the
+reader has moved past it lands in exactly the manifest it would have. Two rules
+keep the rest honest: a segment's buffer is owned by one party at a time (the
+reader while it fills it, then one writer until the segment is stored), and a
+file's segments are recorded by index, so neither a file's segment order nor the
+tree depends on the order the writers finish in. The queue is drained before
+the directories are finalized, and capped so that a single lagging file cannot
+let it grow without bound.
+
+Removing that per-file wait is worth about one round trip per file, which is the
+term that grows when the repository server is not next door: measured on that
+same server (round trip ~0.6 ms), 2000 files of 256 KB went from 2.9 s to 1.7 s
+once the wait was gone, a saving of 0.61 ms per file. A single large file sees
+no change, as it never waited for anything but its own tail.
 
 ### Byte-faithful reconstruction
 
@@ -528,6 +577,12 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
   block, so a change scattered uniformly across a relation grows the repository
   by roughly the touched segments rather than the logical change size; a
   localized change is far cheaper.
+- A rebuilt segment's *write* is overlapped like any other, but its reads of the
+  prior image are not: they go through one seeking reader per file, advanced in
+  order, so each rebuilt segment still pays a serialized round trip to fetch the
+  prior segment it is rebuilt from. Overlapping those too means giving each
+  writer its own prior reader, which is worth doing only if the read-back itself
+  stays (see the storage-amplification limitation above).
 - Incremental reconstruction, like PostgreSQL's `pg_combinebackup`, cannot
   distinguish a genuinely uninitialized (all-zero) extension page from one whose
   modification the WAL summaries failed to record. A below-truncation block
@@ -546,7 +601,7 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
 - Helper invocation from `klio`: `core/internal/kopia/pgbasebackup.go` and
   `core/internal/client/klioclient/kopia/pgbasebackup.go`.
 - Ingestion helper (separate module): `core/kopia-pgbasebackup/` (`main.go`,
-  `internal/ingest/{ingest,incremental,prior,segmap}.go`).
+  `internal/ingest/{ingest,incremental,prior,segmap,segwriter}.go`).
 - Restore (self-contained-tree handling):
   `core/internal/client/klioclient/restore.go`.
 - Operator configuration surface:

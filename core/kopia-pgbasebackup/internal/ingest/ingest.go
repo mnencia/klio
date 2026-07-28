@@ -18,11 +18,12 @@ SPDX-License-Identifier: Apache-2.0
 */
 
 // Package ingest assembles a PostgreSQL BASE_BACKUP tar stream into a Kopia
-// snapshot bottom-up from the Kopia library's primitives: it streams each file
-// through a repository object writer, collects the directory entries as it
-// reads, finalizes the directories deepest-first at the end, and saves a single
-// self-contained snapshot. It tolerates any member order and never stages the
-// backup to local disk.
+// snapshot bottom-up from the Kopia library's primitives: it cuts each file into
+// fixed-size segments written concurrently as their own objects, indexes them
+// into the file's object, files each directory entry once that file's segments
+// are stored, finalizes the directories deepest-first at the end, and saves a
+// single self-contained snapshot. It tolerates any member order and never stages
+// the backup to local disk.
 package ingest
 
 import (
@@ -82,6 +83,11 @@ type Options struct {
 	// its blocks back. Defaults to DefaultSegmentBytes. Rounded down to a whole
 	// number of blocks.
 	SegmentBytes int
+
+	// WriteConcurrency is how many segments are written to the repository at
+	// once. Defaults to DefaultWriteConcurrency, whose comment explains the
+	// choice.
+	WriteConcurrency int
 }
 
 // Stats holds the counters for an ingest.
@@ -175,8 +181,11 @@ type assembler struct {
 	dirs  map[string]*dirNode
 	stats Stats
 
-	// segmentBlocks is the segment size in blocks (SegmentBytes / BlockSize).
+	// segmentBlocks is the segment size in blocks (SegmentBytes / BlockSize) and
+	// segBytes the same size in bytes. segBytes is also the pool's buffer size,
+	// so recomputing it elsewhere risks a window that outgrows the buffer.
 	segmentBlocks int
+	segBytes      int
 	// segMap records this backup's per-file ordered segment object IDs, carried
 	// forward so the next incremental can reference unchanged segments.
 	segMap map[string][]object.ID
@@ -184,6 +193,20 @@ type assembler struct {
 	// the repository's effective policy for the source (see resolveCompressor).
 	// Empty means no compression.
 	compressor compression.Name
+	// segWriter writes segment objects concurrently.
+	segWriter *segmentWriter
+	// pending holds the members already handed to the segment writers whose
+	// object is not resolved yet, in stream order. See resolveSettled.
+	pending []*pendingFile
+}
+
+// pendingFile is a member whose bytes have all been handed to the segment
+// writers but whose object ID, and therefore its directory entry, is not known
+// yet. entry is complete except for that ID.
+type pendingFile struct {
+	logical string
+	entry   *snapshot.DirEntry
+	batch   *segmentBatch
 }
 
 // segRef is a segment object together with the logical byte length it
@@ -224,6 +247,9 @@ func Run(ctx context.Context, rep repo.RepositoryWriter, tarStream io.Reader, op
 	if opts.SegmentBytes <= 0 {
 		opts.SegmentBytes = DefaultSegmentBytes
 	}
+	if opts.WriteConcurrency <= 0 {
+		opts.WriteConcurrency = DefaultWriteConcurrency
+	}
 	segmentBlocks := SegmentBlocksFor(opts.SegmentBytes, opts.BlockSize)
 
 	start := time.Now()
@@ -235,14 +261,23 @@ func Run(ctx context.Context, rep repo.RepositoryWriter, tarStream io.Reader, op
 		start:         start,
 		dirs:          map[string]*dirNode{},
 		segmentBlocks: segmentBlocks,
+		segBytes:      segmentBlocks * opts.BlockSize,
 		segMap:        map[string][]object.ID{},
 		compressor:    resolveCompressor(ctx, rep, opts.Source),
 	}
+	a.segWriter = newSegmentWriter(a, opts.WriteConcurrency, a.segBytes)
+	defer a.segWriter.close()
+
 	// The data directory root is not a tar member, so default it to the mode
 	// PostgreSQL uses for PGDATA.
 	a.ensureDir(".").mode = 0o700
 
 	if err := a.consume(tarStream); err != nil {
+		return nil, err
+	}
+
+	// Every entry must be filed before the directories are built.
+	if err := a.resolveAll(); err != nil {
 		return nil, err
 	}
 
@@ -383,6 +418,9 @@ func (a *assembler) consume(tarStream io.Reader) error {
 		if err := a.handleMember(tr, hdr, name); err != nil {
 			return err
 		}
+		if err := a.resolveSettled(); err != nil {
+			return err
+		}
 	}
 }
 
@@ -398,27 +436,29 @@ func (a *assembler) handleMember(tr *tar.Reader, hdr *tar.Header, name string) e
 		return nil
 	}
 
-	var (
-		de      *snapshot.DirEntry
-		logical string
-		err     error
-	)
 	switch hdr.Typeflag {
 	case tar.TypeReg:
-		de, logical, err = a.addFile(tr, hdr, name)
+		return a.addFile(tr, hdr, name)
 	case tar.TypeSymlink:
-		de, logical, err = a.addSymlink(hdr, name)
+		de, logical, err := a.addSymlink(hdr, name)
+		if err != nil {
+			return err
+		}
+		a.addEntry(logical, de)
+
+		return nil
 	default:
 		// Block/char devices, fifos, etc. do not occur in a PGDATA backup.
 		return nil
 	}
-	if err != nil {
-		return err
-	}
+}
 
+// addEntry files a resolved entry under its parent directory. Directories are
+// only built at end of stream, and Kopia sorts a directory's entries when it
+// builds the manifest, so entries may be filed in any order: a file resolved
+// after the reader moved past it lands in the same manifest it would have.
+func (a *assembler) addEntry(logical string, de *snapshot.DirEntry) {
 	a.ensureDir(path.Dir(logical)).builder.AddEntry(de)
-
-	return nil
 }
 
 // ensureDir returns the directory node for p, creating it (and its ancestors)
@@ -498,82 +538,153 @@ func (a *assembler) writeDir(node *dirNode) (*snapshot.DirEntry, error) {
 // fileContent resolves the content reader and logical path for a plain tar file
 // member. On an incremental backup it strips the INCREMENTAL FROM lines from
 // backup_label so the combined tree is a self-contained full backup.
-func (a *assembler) fileContent(
-	tr *tar.Reader, name string,
-) (io.Reader, string, func(error) error, error) {
-	noop := func(copyErr error) error { return copyErr }
-
+func (a *assembler) fileContent(tr *tar.Reader, name string) (io.Reader, string, error) {
 	if a.opts.Incremental && path.Base(name) == backupLabelFile {
 		raw, rErr := io.ReadAll(tr)
 		if rErr != nil {
-			return nil, "", nil, fmt.Errorf("while reading %q: %w", name, rErr)
+			return nil, "", fmt.Errorf("while reading %q: %w", name, rErr)
 		}
 
-		return bytes.NewReader(stripIncrementalLabelLines(raw)), name, noop, nil
+		return bytes.NewReader(stripIncrementalLabelLines(raw)), name, nil
 	}
 
-	return tr, name, noop, nil
+	return tr, name, nil
 }
 
-// addFile streams a regular file into the repository and returns its DirEntry
-// and the logical path it belongs at. INCREMENTAL.* members are combined
-// against the prior image when running an incremental backup; the returned path
-// has the INCREMENTAL. prefix stripped.
-func (a *assembler) addFile(tr *tar.Reader, hdr *tar.Header, name string) (*snapshot.DirEntry, string, error) {
+// addFile streams a regular file into the repository and files its directory
+// entry. INCREMENTAL.* members are combined against the prior image when
+// running an incremental backup, which resolves them inline; a member that
+// arrives in full is handed to the segment writers and resolved later.
+func (a *assembler) addFile(tr *tar.Reader, hdr *tar.Header, name string) error {
 	if a.opts.Incremental && strings.HasPrefix(path.Base(name), IncrementalFilePrefix) {
 		return a.addIncrementalFile(tr, hdr, name)
 	}
 
-	content, logical, finish, err := a.fileContent(tr, name)
+	content, logical, err := a.fileContent(tr, name)
 	if err != nil {
-		return nil, "", err
+		return err
 	}
 
-	return a.writeSegmentedFile(hdr, logical, content, finish)
+	return a.writeSegmentedFile(hdr, logical, content)
 }
 
-// writeSegmentedFile splits content into fixed-size segment objects, records
-// their IDs for the segment map, and returns a DirEntry whose object is their
-// concatenation. finish reconciles any producer error (a no-op for plain
-// members).
+// writeSegmentedFile splits content into fixed-size segment objects and queues
+// the file for resolution once they are written. It does not wait for them: this
+// goroutine only reads the stream and hands off buffers, so the writers stay
+// busy across file boundaries instead of draining at every one of them.
 func (a *assembler) writeSegmentedFile(
-	hdr *tar.Header, logical string, content io.Reader, finish func(error) error,
-) (*snapshot.DirEntry, string, error) {
-	segBytes := int64(a.segmentBlocks * a.opts.BlockSize)
-
+	hdr *tar.Header, logical string, content io.Reader,
+) error {
 	var (
-		segs    []segRef
 		written int64
+		readErr error
 	)
-	for {
-		oid, n, err := a.writeSegment(content, segBytes, logical)
+	batch := newSegmentBatch()
+	for index := 0; !batch.failed(); index++ {
+		buf := a.segWriter.acquire()
+		n, err := io.ReadFull(content, buf[:a.segBytes])
+		if n > 0 {
+			a.segWriter.submit(batch, logical, index, buf, n)
+			written += int64(n)
+		} else {
+			a.segWriter.release(buf)
+		}
 		if err != nil {
-			_ = finish(err)
+			// A short read (ErrUnexpectedEOF) is the file's last segment and a
+			// zero-length one (EOF) its end; anything else is a real failure.
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				readErr = fmt.Errorf("while reading file %q: %w", logical, err)
+			}
 
-			return nil, "", fmt.Errorf("while writing file %q: %w", logical, err)
-		}
-		if n == 0 {
-			break // end of content
-		}
-		segs = append(segs, segRef{oid: oid, length: n})
-		written += n
-		if n < segBytes {
-			break // last, short segment
+			break
 		}
 	}
-	if err := finish(nil); err != nil {
-		return nil, "", fmt.Errorf("while writing file %q: %w", logical, err)
+
+	batch.seal()
+
+	if readErr != nil {
+		// Drain before dropping this batch, so its buffers are back in the pool.
+		_, _ = batch.wait()
+
+		return readErr
 	}
 
-	oid, err := a.finishFile(logical, segs)
+	// The object ID is the one thing still missing from the entry; resolveHead
+	// fills it in once the segments are written.
+	a.pending = append(a.pending, &pendingFile{
+		logical: logical,
+		entry:   a.fileEntry(hdr, logical, object.EmptyID, written),
+		batch:   batch,
+	})
+
+	return a.capPending()
+}
+
+// maxPendingPerWriter caps the queue of unresolved files at this many per
+// segment writer. Files normally resolve within a few members of being read, so
+// the cap only bites when one file's segments lag far behind the reader, and it
+// keeps the queue and the deferred index writes from growing without bound.
+const maxPendingPerWriter = 4
+
+// capPending keeps the queue within its cap, waiting for the writers when it is
+// over. The queue is otherwise drained opportunistically, between members.
+func (a *assembler) capPending() error {
+	for len(a.pending) > maxPendingPerWriter*a.opts.WriteConcurrency {
+		if err := a.resolveHead(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// resolveSettled resolves the unresolved files whose segments have all been
+// written, oldest first, and stops at the first one still in flight. It runs
+// between tar members, so a file's index object is written while the writers are
+// busy with the next file rather than in a burst at end of stream.
+func (a *assembler) resolveSettled() error {
+	for len(a.pending) > 0 && a.pending[0].batch.done() {
+		if err := a.resolveHead(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// resolveAll drains the queue, waiting for every outstanding segment. It must
+// run before the directories are finalized, so that every entry is filed.
+func (a *assembler) resolveAll() error {
+	for len(a.pending) > 0 {
+		if err := a.resolveHead(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// resolveHead completes the oldest unresolved file, waiting for its segments.
+func (a *assembler) resolveHead() error {
+	p := a.pending[0]
+	a.pending = a.pending[1:]
+
+	segs, err := p.batch.wait()
 	if err != nil {
-		return nil, "", err
+		return fmt.Errorf("while writing file %q: %w", p.logical, err)
 	}
+
+	oid, err := a.finishFile(p.logical, segs)
+	if err != nil {
+		return err
+	}
+	p.entry.ObjectID = oid
 
 	a.stats.FileCount++
-	a.stats.TotalSize += written
+	a.stats.TotalSize += p.entry.FileSize
+	a.addEntry(p.logical, p.entry)
 
-	return a.fileEntry(hdr, logical, oid, written), logical, nil
+	return nil
 }
 
 // resolveCompressor returns the compressor the repository's effective policy
@@ -590,23 +701,18 @@ func resolveCompressor(ctx context.Context, rep repo.Repository, source snapshot
 	return pol.CompressionPolicy.CompressorName
 }
 
-// writeSegment writes up to limit bytes from content into a new object,
-// returning its ID and the number of bytes written (0 at end of content).
-func (a *assembler) writeSegment(content io.Reader, limit int64, logical string) (object.ID, int64, error) {
+// writeSegmentBytes writes one segment's bytes as a new object and returns its
+// ID. It is called from the segment-writer pool, so it must touch nothing on the
+// assembler beyond the repository writer and the resolved compressor.
+func (a *assembler) writeSegmentBytes(data []byte, logical string) (object.ID, error) {
 	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + logical, Compressor: a.compressor})
 	defer writer.Close() //nolint:errcheck
 
-	n, err := io.CopyN(writer, content, limit)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return object.EmptyID, 0, err
-	}
-	if n == 0 {
-		return object.EmptyID, 0, nil
+	if _, err := writer.Write(data); err != nil {
+		return object.EmptyID, err
 	}
 
-	oid, err := writer.Result()
-
-	return oid, n, err
+	return writer.Result()
 }
 
 // finishFile records a file's segment list for the segment map and resolves its
@@ -697,17 +803,15 @@ func (a *assembler) fileEntry(hdr *tar.Header, logical string, oid object.ID, si
 // prefix stripped). An unchanged file references the prior object directly; a
 // changed file is combined segment by segment, referencing unchanged segments
 // from the prior and rebuilding only those that contain a changed block.
-func (a *assembler) addIncrementalFile(
-	tr *tar.Reader, hdr *tar.Header, name string,
-) (*snapshot.DirEntry, string, error) {
+func (a *assembler) addIncrementalFile(tr *tar.Reader, hdr *tar.Header, name string) error {
 	relPath := path.Join(path.Dir(name), strings.TrimPrefix(path.Base(name), IncrementalFilePrefix))
 
 	header, err := ParseIncrementalHeader(tr, a.opts.BlockSize)
 	if err != nil {
-		return nil, "", fmt.Errorf("while parsing incremental header for %q: %w", name, err)
+		return fmt.Errorf("while parsing incremental header for %q: %w", name, err)
 	}
 	if a.opts.Prior == nil {
-		return nil, "", fmt.Errorf("incremental member %q but no prior image configured", name)
+		return fmt.Errorf("incremental member %q but no prior image configured", name)
 	}
 
 	// Metadata-only fast path: with no changed blocks and an unchanged length,
@@ -715,12 +819,12 @@ func (a *assembler) addIncrementalFile(
 	// object directly and carry its segment list forward unchanged.
 	if len(header.BlockNumbers) == 0 {
 		if err := assertDrained(tr, make([]byte, 1)); err != nil {
-			return nil, "", fmt.Errorf("while combining %q: %w", name, err)
+			return fmt.Errorf("while combining %q: %w", name, err)
 		}
 
 		prior, err := a.opts.Prior.Entry(relPath)
 		if err != nil {
-			return nil, "", fmt.Errorf("while resolving prior entry for %q: %w", relPath, err)
+			return fmt.Errorf("while resolving prior entry for %q: %w", relPath, err)
 		}
 
 		if prior.FileSize == int64(header.TruncationBlockLength)*int64(a.opts.BlockSize) {
@@ -728,8 +832,9 @@ func (a *assembler) addIncrementalFile(
 			a.stats.ReusedFiles++
 			a.stats.TotalSize += prior.FileSize
 			a.carryPriorSegments(relPath, prior.ObjectID)
+			a.addEntry(relPath, a.fileEntry(hdr, relPath, prior.ObjectID, prior.FileSize))
 
-			return a.fileEntry(hdr, relPath, prior.ObjectID, prior.FileSize), relPath, nil
+			return nil
 		}
 	}
 
@@ -769,7 +874,7 @@ func (a *assembler) carryPriorSegments(relPath string, priorOID object.ID) {
 //nolint:cyclop // the per-segment reference/rebuild walk plus its end-of-stream
 func (a *assembler) combineSegments(
 	blockData io.Reader, hdr *tar.Header, h *IncrementalHeader, relPath string,
-) (*snapshot.DirEntry, string, error) {
+) error {
 	sb := a.segmentBlocks
 	total := int(h.TruncationBlockLength)
 	priorBlocks := a.priorBlockCount(relPath)
@@ -803,10 +908,9 @@ func (a *assembler) combineSegments(
 		return reader, nil
 	}
 
-	buf := make([]byte, a.opts.BlockSize)
-	zeroBlock := make([]byte, a.opts.BlockSize)
 	cursor := 0 // index into h.BlockNumbers
-	var segs []segRef
+	batch := newSegmentBatch()
+	fillErr := error(nil)
 
 	for start := 0; start < total; start += sb {
 		end := min(start+sb, total)
@@ -816,81 +920,99 @@ func (a *assembler) combineSegments(
 		segLen := int64(end-start) * int64(a.opts.BlockSize)
 
 		if !dirty && canReference && j < len(priorSegs) && end == priorEnd {
-			segs = append(segs, segRef{oid: priorSegs[j], length: segLen})
+			batch.set(j, segRef{oid: priorSegs[j], length: segLen})
 			a.stats.ReferencedSegments++
 
 			continue
 		}
 
-		oid, err := a.rebuildSegment(blockData, h, &cursor, start, end, buf, zeroBlock, ensureReader, relPath)
-		if err != nil {
-			return nil, "", err
+		// Assemble the segment in a pool buffer here, on this goroutine, because
+		// both sources have to be read in order: the incremental blocks come
+		// from the tar stream, and the prior image from one seeking reader. Only
+		// the write is handed off, which is what overlaps its round trip with
+		// the next segment's reads.
+		buf := a.segWriter.acquire()
+		if err := a.fillSegment(blockData, h, &cursor, start, end, buf[:segLen], ensureReader); err != nil {
+			a.segWriter.release(buf)
+			fillErr = fmt.Errorf("while combining %q: %w", relPath, err)
+
+			break
 		}
-		segs = append(segs, segRef{oid: oid, length: segLen})
+		a.segWriter.submit(batch, relPath, j, buf, int(segLen))
 		a.stats.RebuiltSegments++
 	}
 
-	if cursor != len(h.BlockNumbers) {
-		return nil, "", fmt.Errorf("%w: consumed %d of %d present blocks",
-			ErrReconstructIncomplete, cursor, len(h.BlockNumbers))
+	// The stream checks have to run before this member is left behind.
+	if fillErr == nil {
+		fillErr = a.checkCombineConsumedStream(blockData, h, cursor, relPath)
 	}
-	if err := assertDrained(blockData, buf[:1]); err != nil {
-		return nil, "", fmt.Errorf("while combining %q: %w", relPath, err)
-	}
+	batch.seal()
+	if fillErr != nil {
+		_, _ = batch.wait()
 
-	oid, err := a.finishFile(relPath, segs)
-	if err != nil {
-		return nil, "", err
+		return fillErr
 	}
 
 	size := int64(total) * int64(a.opts.BlockSize)
-	a.stats.FileCount++
-	a.stats.TotalSize += size
+	a.pending = append(a.pending, &pendingFile{
+		logical: relPath,
+		entry:   a.fileEntry(hdr, relPath, object.EmptyID, size),
+		batch:   batch,
+	})
 
-	return a.fileEntry(hdr, relPath, oid, size), relPath, nil
+	return a.capPending()
 }
 
-// rebuildSegment writes one segment covering output blocks [start, end): a
-// present block comes from blockData (advancing cursor), an absent one from the
-// prior image.
-func (a *assembler) rebuildSegment(
-	blockData io.Reader, h *IncrementalHeader, cursor *int, start, end int, buf, zeroBlock []byte,
-	ensureReader func() (PriorBlockReader, error), relPath string,
-) (object.ID, error) {
-	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + relPath, Compressor: a.compressor})
-	defer writer.Close() //nolint:errcheck
+// checkCombineConsumedStream verifies the combine consumed exactly the blocks
+// the header promised, and that nothing follows them. Either mismatch means the
+// header and the data section disagree, which would otherwise be stored as a
+// silently corrupt segment.
+func (a *assembler) checkCombineConsumedStream(
+	blockData io.Reader, h *IncrementalHeader, cursor int, relPath string,
+) error {
+	if cursor != len(h.BlockNumbers) {
+		return fmt.Errorf("%w: consumed %d of %d present blocks",
+			ErrReconstructIncomplete, cursor, len(h.BlockNumbers))
+	}
+	if err := assertDrained(blockData, make([]byte, 1)); err != nil {
+		return fmt.Errorf("while combining %q: %w", relPath, err)
+	}
+
+	return nil
+}
+
+// fillSegment assembles one segment covering output blocks [start, end) into
+// dst: a present block comes from blockData (advancing cursor), an absent one
+// from the prior image.
+func (a *assembler) fillSegment(
+	blockData io.Reader, h *IncrementalHeader, cursor *int, start, end int, dst []byte,
+	ensureReader func() (PriorBlockReader, error),
+) error {
+	bs := a.opts.BlockSize
 
 	for i := start; i < end; i++ {
+		block := dst[(i-start)*bs : (i-start+1)*bs]
+
 		if *cursor < len(h.BlockNumbers) && int(h.BlockNumbers[*cursor]) == i {
-			if _, err := io.ReadFull(blockData, buf); err != nil {
-				return object.EmptyID, fmt.Errorf("while reading incremental block %d: %w", i, err)
+			if _, err := io.ReadFull(blockData, block); err != nil {
+				return fmt.Errorf("while reading incremental block %d: %w", i, err)
 			}
 			*cursor++
-			if _, err := writer.Write(buf); err != nil {
-				return object.EmptyID, fmt.Errorf("while writing block %d: %w", i, err)
-			}
 
 			continue
 		}
 
 		reader, err := ensureReader()
 		if err != nil {
-			return object.EmptyID, err
+			return err
 		}
-		// A block beyond the prior image is an uninitialized extension block:
-		// zero-fill it, matching pg_combinebackup (see writePriorOrZeroBlock).
 		blockNum := uint32(i) //nolint:gosec // block index fits uint32
-		if werr := writePriorOrZeroBlock(reader, blockNum, zeroBlock, writer); werr != nil {
-			return object.EmptyID, werr
+		if rerr := copyPriorOrZeroBlock(reader, blockNum, block); rerr != nil {
+			return rerr
 		}
 	}
 
-	oid, err := writer.Result()
-	if err != nil {
-		return object.EmptyID, fmt.Errorf("while finalizing segment of %q: %w", relPath, err)
-	}
-
-	return oid, nil
+	return nil
 }
 
 // priorBlockCount returns the prior file's length in blocks, or 0 when the file

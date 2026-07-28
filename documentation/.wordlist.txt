@@ -62,6 +62,7 @@ GetMetadata
 GetMetadataRequest
 GetRequest
 GetResult
+GiB
 Grafana
 IAM
 IRSA
@@ -259,6 +260,7 @@ fullnameOverride
 gRPC
 ghcr
 github
+goroutine
 goroutines
 grpc
 gzip

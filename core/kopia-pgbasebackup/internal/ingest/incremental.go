@@ -168,27 +168,30 @@ type PriorBlockReader interface {
 	io.Closer
 }
 
-// writePriorOrZeroBlock writes output block i from the prior image. A block at
-// or beyond the prior image (io.EOF) is one the server extended the file to but
-// never WAL-logged (an uninitialized page); PostgreSQL's pg_combinebackup
-// materializes it as zero-filled, so match that rather than failing. Any other
-// read failure is a genuine error.
-func writePriorOrZeroBlock(prior PriorBlockReader, i uint32, zeroBlock []byte, out io.Writer) error {
+// copyPriorOrZeroBlock copies output block i from the prior image into dst. A
+// block at or beyond the prior image (io.EOF) is one the server extended the
+// file to but never WAL-logged (an uninitialized page); PostgreSQL's
+// pg_combinebackup materializes it as zero-filled, so match that rather than
+// failing. Any other read failure is a genuine error.
+func copyPriorOrZeroBlock(prior PriorBlockReader, i uint32, dst []byte) error {
 	block, err := prior.ReadBlock(i)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			if _, werr := out.Write(zeroBlock); werr != nil {
-				return fmt.Errorf("while writing zero-filled block %d: %w", i, werr)
-			}
+			clear(dst)
 
 			return nil
 		}
 
 		return fmt.Errorf("%w: block %d: %w", ErrBlockNotAvailable, i, err)
 	}
-	if _, err := out.Write(block); err != nil {
-		return fmt.Errorf("while writing prior block %d: %w", i, err)
+	// dst is a window into a reused segment buffer, so a short block would leave
+	// the previous segment's bytes in its tail instead of failing. Reject it:
+	// a PriorBlockReader owes a whole block or an error.
+	if len(block) != len(dst) {
+		return fmt.Errorf("%w: block %d: got %d bytes, want %d",
+			ErrBlockNotAvailable, i, len(block), len(dst))
 	}
+	copy(dst, block)
 
 	return nil
 }

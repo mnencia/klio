@@ -79,7 +79,7 @@ type KopiaPriorImage struct {
 
 	// zeroFilledBlocks counts blocks requested past the end of a prior file
 	// object. Every such request is materialized by the combine as a zero-filled
-	// uninitialized extension block (see writePriorOrZeroBlock), so this is the
+	// uninitialized extension block (see copyPriorOrZeroBlock), so this is the
 	// number of blocks the backup manufactured rather than sourced - normally a
 	// small, steady number (e.g. pg_statistic churn); a spike is worth a look.
 	zeroFilledBlocks atomic.Int64
@@ -242,9 +242,9 @@ type objectBlockReader struct {
 	blockSize int
 
 	// buf is reused across ReadBlock calls instead of allocating a fresh
-	// blockSize buffer each time. Safe: the caller (rebuildSegment) writes out
-	// each returned block immediately and never retains it, and one
-	// objectBlockReader is only ever driven synchronously from a single
+	// blockSize buffer each time. Safe: the caller (fillSegment) copies each
+	// returned block into the segment it is assembling and never retains it, and
+	// one objectBlockReader is only ever driven synchronously from a single
 	// combine for one file.
 	buf []byte
 
@@ -267,7 +267,7 @@ func (o *objectBlockReader) ReadBlock(n uint32) ([]byte, error) {
 
 	// A block that is not fully present in the prior object does not exist in
 	// the prior image. Report it as io.EOF so the combiner zero-fills it as an
-	// uninitialized extension block (see writePriorOrZeroBlock). This mirrors
+	// uninitialized extension block (see copyPriorOrZeroBlock). This mirrors
 	// pg_combinebackup, which sources only whole blocks below floor(len/BLCKSZ)
 	// and zero-fills the rest, so a non-block-aligned prior degrades gracefully
 	// instead of failing the backup.
