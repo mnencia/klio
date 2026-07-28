@@ -44,6 +44,26 @@ func TestParseIngestResult(t *testing.T) {
 		assert.Equal(t, int64(7), result.Stats.FileCount)
 	})
 
+	t.Run("incremental statistics are parsed", func(t *testing.T) {
+		// The segment counters were silently dropped before they were added to
+		// IngestStats, so the JSON names have to keep matching the helper's.
+		input := []byte(`{
+			"manifestId": "m-1",
+			"stats": {
+				"reusedFiles": 3, "priorReadBytes": 4096, "zeroFilledBlocks": 1,
+				"referencedSegments": 900, "rebuiltSegments": 100
+			}
+		}`)
+
+		result, err := parseIngestResult(input)
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), result.Stats.ReusedFiles)
+		assert.Equal(t, int64(4096), result.Stats.PriorReadBytes)
+		assert.Equal(t, int64(1), result.Stats.ZeroFilledBlocks)
+		assert.Equal(t, int64(900), result.Stats.ReferencedSegments)
+		assert.Equal(t, int64(100), result.Stats.RebuiltSegments)
+	})
+
 	t.Run("surrounding whitespace is tolerated", func(t *testing.T) {
 		input := []byte("\n  {\"manifestId\": \"m-1\"}\n")
 
