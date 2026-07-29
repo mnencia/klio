@@ -61,6 +61,8 @@ func TestBuildVerifyArgs(t *testing.T) {
 			"--json",
 			"--disable-file-logging",
 			"--config-file=/etc/kopia/config",
+			"--parallel=32",
+			"--file-parallelism=32",
 		}, args)
 	})
 
@@ -77,8 +79,20 @@ func TestBuildVerifyArgs(t *testing.T) {
 			"--json",
 			"--disable-file-logging",
 			"--config-file=/etc/kopia/config",
+			"--parallel=32",
+			"--file-parallelism=32",
 			"--file-id=kaaa",
 			"--file-id=kbbb",
 		}, args)
+	})
+
+	t.Run("parallelism is requested explicitly", func(t *testing.T) {
+		// Kopia defaults to --parallel 8 and --file-parallelism NumCPU, which
+		// leaves verification of a multi-million-object snapshot waiting on
+		// serialized round trips to the repository server.
+		args := buildVerifyArgs("/etc/kopia/config")
+
+		assert.Contains(t, args, "--parallel=32")
+		assert.Contains(t, args, "--file-parallelism=32")
 	})
 }
