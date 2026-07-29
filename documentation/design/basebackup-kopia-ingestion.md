@@ -259,15 +259,29 @@ with one writer to 5.3 s with 16 (147 to 383 MiB/s), the latter being what that
 repository sustains with multi-megabyte objects. The useful concurrency is
 therefore set by the round-trip time rather than by the core count.
 
-A segment rebuilt from an `INCREMENTAL.*` member goes through the same pool. It
-is assembled in a pool buffer on the reader goroutine, because its two sources
-have to be read in order (the changed blocks from the tar stream, the unchanged
-ones from the prior image through a single seeking reader), and only the write
-is handed off. That still removes one of the two round trips a rebuilt segment
-pays, overlapping its write with the next segment's reads: 2000 rebuilt segments
-went from 4.9 s to 3.4 s, a saving of 0.76 ms each. Overlapping the prior-image
-reads too would need a reader per worker, which is not done (see
-[Limitations](#limitations)).
+A segment rebuilt from an `INCREMENTAL.*` member goes through the same pool, and
+for an incremental backup this is where nearly all of the time goes. Such a
+segment has two sources: the changed blocks, which arrive in the tar stream and
+so must be read in order, and its unchanged blocks, which come from the prior
+backup. Only the first is read on the goroutine walking the stream, which
+records the blocks it did not fill; a writer then obtains those from the prior
+image and writes the segment, so the reads overlap each other and the writes.
+
+Overlapping them matters more than it sounds. Obtaining one 128 KB segment from
+the repository costs about 8.4 ms against a cross-zone server, where moving the
+same bytes costs about 1 ms, and there is one such fetch per rebuilt segment: a
+566 GB incremental spent roughly 55 of its 59 minutes performing them one after
+another. Eight concurrent readers move 5.6x as much, and locally an incremental
+of 64 files with half their segments dirty went from 8.5 s to 2.7 s.
+
+A writer reads by object ID rather than by path, because resolving a path
+consults a cache that must not be touched concurrently; the reader resolves each
+member's prior file once and passes the ID down. That object is normally the
+prior backup's segment at the same index rather than the whole prior file, since
+it starts at the same block and, being a single content, costs one fetch and no
+seek table. It may be shorter than the segment it fills when the file has grown,
+which needs no special case: a block past its end reads as end-of-file, which
+the combine materializes as a zero-filled uninitialized extension block.
 
 The reader also does not stop at a file boundary. Waiting there would drain the
 pipeline once per file and cap the useful concurrency at the number of segments
@@ -577,12 +591,12 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
   block, so a change scattered uniformly across a relation grows the repository
   by roughly the touched segments rather than the logical change size; a
   localized change is far cheaper.
-- A rebuilt segment's *write* is overlapped like any other, but its reads of the
-  prior image are not: they go through one seeking reader per file, advanced in
-  order, so each rebuilt segment still pays a serialized round trip to fetch the
-  prior segment it is rebuilt from. Overlapping those too means giving each
-  writer its own prior reader, which is worth doing only if the read-back itself
-  stays (see the storage-amplification limitation above).
+- The read-back is overlapped, not removed. An incremental still transfers the
+  unchanged blocks of every segment holding a changed one, in both directions:
+  it reads them from the prior backup and writes them again. Concurrency hides
+  the latency of that, and compression shrinks what is stored, but the transfer
+  itself is inherent to rebuilding a segment (see the amplification limitation
+  above), and it is what a design that stored the delta instead would avoid.
 - Incremental reconstruction, like PostgreSQL's `pg_combinebackup`, cannot
   distinguish a genuinely uninitialized (all-zero) extension page from one whose
   modification the WAL summaries failed to record. A below-truncation block
@@ -601,7 +615,7 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
 - Helper invocation from `klio`: `core/internal/kopia/pgbasebackup.go` and
   `core/internal/client/klioclient/kopia/pgbasebackup.go`.
 - Ingestion helper (separate module): `core/kopia-pgbasebackup/` (`main.go`,
-  `internal/ingest/{ingest,incremental,prior,segmap,segwriter}.go`).
+  `internal/ingest/{ingest,incremental,prior,segmap,segwriter,phases}.go`).
 - Restore (self-contained-tree handling):
   `core/internal/client/klioclient/restore.go`.
 - Operator configuration surface:

@@ -21,6 +21,8 @@ package ingest
 
 import (
 	"sync"
+
+	"github.com/kopia/kopia/repo/object"
 )
 
 // DefaultWriteConcurrency is the number of segments written to the repository
@@ -72,13 +74,42 @@ type segmentWriter struct {
 }
 
 // segmentJob is one segment to write. data is the filled prefix of buf, and buf
-// is what goes back to the pool once the segment is stored.
+// is what goes back to the pool once the segment is stored. fill, when set,
+// names prior-image blocks the worker must obtain before the segment is
+// complete: an incremental hands off a segment holding only the blocks that
+// arrived in the tar stream.
 type segmentJob struct {
 	data    []byte
 	buf     []byte
 	logical string
 	index   int
 	batch   *segmentBatch
+	fill    *priorFill
+}
+
+// priorFill is the prior-image work a worker does before writing a rebuilt
+// segment: read each block in holes out of source and place it in the segment.
+//
+// Doing this on the worker is the point. A prior read costs a round trip to the
+// repository (8.4 ms against a cross-zone server, where moving the same 128 KB
+// costs about 1 ms), and there is one per rebuilt segment, so performing them one
+// at a time on the goroutine reading the tar stream made them nearly the whole
+// cost of an incremental backup.
+//
+// source is usually the prior backup's *segment* at this index rather than the
+// whole prior file: it covers exactly the blocks this segment needs, it is a
+// single content so opening it is one fetch and no seek table, and it needs no
+// path resolution. Falling back to the whole prior file costs an extra fetch for
+// its seek table.
+//
+// holes are indices within the segment, so hole k lives at k*BLCKSZ in the
+// segment and is read from block srcFirst+k of source. srcFirst is 0 when source
+// is this segment's prior counterpart and the segment's first block number when
+// it is the whole prior file, which is the only difference between the two cases.
+type priorFill struct {
+	source   object.ID
+	srcFirst int
+	holes    []int
 }
 
 // segmentBatch collects one file's segment writes. Results are recorded by
@@ -132,12 +163,24 @@ func (sw *segmentWriter) work() {
 	defer sw.wg.Done()
 
 	for job := range sw.jobs {
-		oid, err := sw.a.writeSegmentBytes(job.data, job.logical)
+		oid, err := sw.fillAndWrite(job)
 		sw.free <- job.buf
 		// record last: it can settle the batch, after which the reader may
 		// resolve the file, and by then the buffer must be back in the pool.
 		job.batch.record(job.index, segRef{oid: oid, length: int64(len(job.data))}, err)
 	}
+}
+
+// fillAndWrite completes a segment and stores it: for a rebuilt segment that
+// means obtaining its unchanged blocks from the prior image first.
+func (sw *segmentWriter) fillAndWrite(job segmentJob) (object.ID, error) {
+	if job.fill != nil {
+		if err := sw.a.fillFromPrior(job.fill, job.data); err != nil {
+			return object.EmptyID, err
+		}
+	}
+
+	return sw.a.writeSegmentBytes(job.data, job.logical)
 }
 
 // close stops the workers. Every batch must have been resolved first.
@@ -161,6 +204,17 @@ func (sw *segmentWriter) release(buf []byte) {
 func (sw *segmentWriter) submit(batch *segmentBatch, logical string, index int, buf []byte, n int) {
 	batch.add()
 	sw.jobs <- segmentJob{data: buf[:n], buf: buf, logical: logical, index: index, batch: batch}
+}
+
+// submitRebuilt queues a segment that still needs prior-image blocks, which the
+// worker obtains before writing it.
+func (sw *segmentWriter) submitRebuilt(
+	batch *segmentBatch, logical string, index int, buf []byte, n int, fill *priorFill,
+) {
+	batch.add()
+	sw.jobs <- segmentJob{
+		data: buf[:n], buf: buf, logical: logical, index: index, batch: batch, fill: fill,
+	}
 }
 
 // add accounts for a segment before it is queued. Counting it afterwards would

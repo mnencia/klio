@@ -160,6 +160,12 @@ type PriorImage interface {
 	// at relPath (the INCREMENTAL. prefix already stripped).
 	BlockReader(relPath string, blockSize int) (PriorBlockReader, error)
 
+	// BlockReaderForObject returns a reader for an already-resolved prior
+	// object, whose block numbers are relative to that object. Resolving a path
+	// is not safe to do concurrently, so a rebuild resolves on the reading
+	// goroutine and reads through this from a writer.
+	BlockReaderForObject(oid object.ID, blockSize int) (PriorBlockReader, error)
+
 	// Entry returns the prior snapshot's file entry for relPath (its ObjectID
 	// and size), so an unchanged file can reference the prior object directly
 	// instead of reading and rehashing every block to rebuild an identical one.
@@ -201,9 +207,16 @@ type dirNode struct {
 // scattered change amplifies repo growth; smaller segments multiply the segment
 // objects, the per-backup segment map, and the content index. 128 KiB keeps
 // nearly all of the locality readback win while cutting scattered amplification
-// by more than an order of magnitude versus a multi-megabyte segment, and its
-// index/maintenance cost is already near the floor. It is a whole number of
-// blocks for any BLCKSZ up to 128 KiB.
+// by more than an order of magnitude versus a multi-megabyte segment. It is a
+// whole number of blocks for any BLCKSZ up to 128 KiB.
+//
+// The object count this implies is not free, and costs more than the index size
+// this comment once claimed was near the floor. A 566 GB backup is ~4.6 M
+// segments, and the post-backup `kopia snapshot verify` walks every object: it
+// took 21m54s remotely, against seconds for the ~140 K objects the filesystem
+// path produces for the same database at Kopia's ~4 MB dynamic chunks. Any
+// revisit of this size should weigh verification and maintenance per object, not
+// just amplification and index size.
 const DefaultSegmentBytes = 128 << 10
 
 // assembler builds a snapshot from a tar stream.
@@ -924,8 +937,20 @@ func (a *assembler) combineSegments(
 ) error {
 	sb := a.segmentBlocks
 	total := int(h.TruncationBlockLength)
-	priorBlocks := a.priorBlockCount(relPath)
 	priorSegs, _ := a.opts.Prior.Segments(relPath)
+
+	// Resolve the prior file once per member: resolution walks the prior tree
+	// through a cache that must not be touched concurrently, so it cannot happen
+	// on a worker, and its length is what decides whether referencing is even
+	// structurally possible. A member with no prior entry is only an error if a
+	// segment actually needs prior blocks, which sourceFor decides.
+	prior := priorLocator{relPath: relPath, segments: priorSegs}
+	prior.entry, prior.entryErr = a.opts.Prior.Entry(relPath)
+
+	priorBlocks := 0
+	if prior.entryErr == nil {
+		priorBlocks = int(prior.entry.FileSize) / a.opts.BlockSize
+	}
 
 	// Only reference prior segments when the prior segment list is structurally
 	// consistent with the prior file length (exactly one object per sb-block
@@ -935,25 +960,7 @@ func (a *assembler) combineSegments(
 	// whose earlier backup persisted one. This count check assumes the prior map
 	// was produced at the current segment size; that size match is the caller's
 	// responsibility (see PriorImage.Segments), not verified here.
-	canReference := len(priorSegs) == (priorBlocks+sb-1)/sb
-
-	var reader PriorBlockReader
-	defer func() {
-		if reader != nil {
-			_ = reader.Close()
-		}
-	}()
-	ensureReader := func() (PriorBlockReader, error) {
-		if reader == nil {
-			r, err := a.opts.Prior.BlockReader(relPath, a.opts.BlockSize)
-			if err != nil {
-				return nil, fmt.Errorf("while opening prior image of %q: %w", relPath, err)
-			}
-			reader = r
-		}
-
-		return reader, nil
-	}
+	prior.canReference = len(priorSegs) == (priorBlocks+sb-1)/sb
 
 	cursor := 0 // index into h.BlockNumbers
 	batch := newSegmentBatch()
@@ -966,26 +973,36 @@ func (a *assembler) combineSegments(
 		priorEnd := min(start+sb, priorBlocks)
 		segLen := int64(end-start) * int64(a.opts.BlockSize)
 
-		if !dirty && canReference && j < len(priorSegs) && end == priorEnd {
+		if !dirty && prior.canReference && j < len(priorSegs) && end == priorEnd {
 			batch.set(j, segRef{oid: priorSegs[j], length: segLen})
 			a.stats.ReferencedSegments++
 
 			continue
 		}
 
-		// Assemble the segment in a pool buffer here, on this goroutine, because
-		// both sources have to be read in order: the incremental blocks come
-		// from the tar stream, and the prior image from one seeking reader. Only
-		// the write is handed off, which is what overlaps its round trip with
-		// the next segment's reads.
+		// Read the blocks that arrived in the tar stream here, on this goroutine,
+		// because the stream has to be consumed in order. Everything else about
+		// this segment — fetching its unchanged blocks from the prior image and
+		// writing it — is handed to a worker, so those round trips overlap
+		// instead of running one at a time.
 		buf := a.segWriter.acquire()
-		if err := a.fillSegment(blockData, h, &cursor, start, end, buf[:segLen], ensureReader); err != nil {
+		holes, err := a.readPresentBlocks(blockData, h, &cursor, start, end, buf[:segLen])
+		if err != nil {
 			a.segWriter.release(buf)
 			fillErr = fmt.Errorf("while combining %q: %w", relPath, err)
 
 			break
 		}
-		a.segWriter.submit(batch, relPath, j, buf, int(segLen))
+
+		fill, err := prior.sourceFor(holes, start, j)
+		if err != nil {
+			a.segWriter.release(buf)
+			fillErr = err
+
+			break
+		}
+
+		a.segWriter.submitRebuilt(batch, relPath, j, buf, int(segLen), fill)
 		a.stats.RebuiltSegments++
 	}
 
@@ -1028,42 +1045,108 @@ func (a *assembler) checkCombineConsumedStream(
 	return nil
 }
 
-// fillSegment assembles one segment covering output blocks [start, end) into
-// dst: a present block comes from blockData (advancing cursor), an absent one
-// from the prior image.
-func (a *assembler) fillSegment(
+// readPresentBlocks places the blocks of segment [start, end) that arrived in
+// the tar stream into dst, advancing cursor, and returns the indices *within the
+// segment* that it did not fill. Those holes are the segment's unchanged blocks,
+// which a worker reads from the prior image; keeping only the stream read here is
+// what allows that.
+func (a *assembler) readPresentBlocks(
 	blockData io.Reader, h *IncrementalHeader, cursor *int, start, end int, dst []byte,
-	ensureReader func() (PriorBlockReader, error),
-) error {
+) ([]int, error) {
 	bs := a.opts.BlockSize
 
+	var holes []int
 	for i := start; i < end; i++ {
-		block := dst[(i-start)*bs : (i-start+1)*bs]
-
 		if *cursor < len(h.BlockNumbers) && int(h.BlockNumbers[*cursor]) == i {
+			block := dst[(i-start)*bs : (i-start+1)*bs]
+
 			readStart := time.Now()
 			_, err := io.ReadFull(blockData, block)
 			a.phases.addTarRead(readStart)
 			if err != nil {
-				return fmt.Errorf("while reading incremental block %d: %w", i, err)
+				return nil, fmt.Errorf("while reading incremental block %d: %w", i, err)
 			}
 			*cursor++
 
 			continue
 		}
 
-		reader, err := ensureReader()
-		if err != nil {
-			return err
-		}
-		blockNum := uint32(i) //nolint:gosec // block index fits uint32
-		fetchStart := time.Now()
-		rerr := copyPriorOrZeroBlock(reader, blockNum, block)
-		a.phases.addPriorRead(fetchStart)
-		a.phases.addPriorBlockRead()
-		if rerr != nil {
+		holes = append(holes, i-start)
+	}
+
+	return holes, nil
+}
+
+// priorLocator is a member's prior-image state, resolved once on the goroutine
+// reading the tar stream and consulted per segment.
+type priorLocator struct {
+	relPath  string
+	segments []object.ID
+	entry    *snapshot.DirEntry
+	entryErr error
+
+	// canReference says the segment list is structurally consistent with the
+	// prior file's length, which is what makes segment k of it correspond to
+	// this backup's segment k.
+	canReference bool
+}
+
+// sourceFor decides where a rebuilt segment's unchanged blocks come from, or
+// returns nil when it has none to fetch.
+//
+// The prior backup's segment at this index is preferred: it starts at the same
+// block, so a hole at segment index k is block k of it, and being a single
+// content means opening it costs one fetch and no seek table. It may be *shorter*
+// than this segment when the file has grown, and that needs no special case: a
+// block past its end reads as EOF, which the combine materializes as a
+// zero-filled uninitialized extension block, exactly as PostgreSQL's
+// pg_combinebackup does.
+//
+// Without a usable segment list the whole prior file stands in, at the cost of an
+// extra fetch for its seek table. Either way the prior file has to exist, so a
+// resolution failure surfaces here rather than being mistaken for an empty prior.
+func (p *priorLocator) sourceFor(holes []int, start, j int) (*priorFill, error) {
+	if len(holes) == 0 {
+		return nil, nil //nolint:nilnil // no holes means no prior work, not an error
+	}
+
+	if p.canReference && j < len(p.segments) {
+		return &priorFill{source: p.segments[j], srcFirst: 0, holes: holes}, nil
+	}
+
+	if p.entryErr != nil {
+		return nil, fmt.Errorf("while resolving prior image of %q: %w", p.relPath, p.entryErr)
+	}
+
+	return &priorFill{source: p.entry.ObjectID, srcFirst: start, holes: holes}, nil
+}
+
+// fillFromPrior obtains a rebuilt segment's unchanged blocks. It runs on a
+// segment writer, so it opens its own reader and shares nothing but the
+// repository and the atomic counters.
+func (a *assembler) fillFromPrior(fill *priorFill, dst []byte) error {
+	bs := a.opts.BlockSize
+
+	// Time from before the open: opening a prior object is what fetches its
+	// content, so timing only the block copies would attribute nearly none of
+	// the cost to the prior read.
+	fetchStart := time.Now()
+	defer a.phases.addPriorRead(fetchStart)
+
+	reader, err := a.opts.Prior.BlockReaderForObject(fill.source, bs)
+	if err != nil {
+		return err
+	}
+	defer reader.Close() //nolint:errcheck
+
+	for _, k := range fill.holes {
+		block := dst[k*bs : (k+1)*bs]
+
+		blockNum := uint32(fill.srcFirst + k) //nolint:gosec // block index fits uint32
+		if rerr := copyPriorOrZeroBlock(reader, blockNum, block); rerr != nil {
 			return rerr
 		}
+		a.phases.addPriorBlockRead()
 	}
 
 	return nil

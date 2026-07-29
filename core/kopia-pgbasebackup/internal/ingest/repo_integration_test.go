@@ -446,11 +446,14 @@ func assertFileEqual(t *testing.T, path string, want []byte) {
 	}
 }
 
-// recordingPrior wraps a PriorImage and records the relPaths passed to
-// BlockReader, so a test can assert the metadata-only fast path read no blocks.
+// recordingPrior wraps a PriorImage and records every prior read it opens, so a
+// test can assert whether reconstruction read the prior image at all. Both entry
+// points must be recorded: a rebuild reads by object ID (from a segment writer),
+// while the whole-file paths resolve by path.
 type recordingPrior struct {
 	inner            PriorImage
 	blockReaderPaths []string
+	blockReaderOIDs  []object.ID
 }
 
 //nolint:ireturn // mirrors the wrapped PriorImage signature
@@ -460,12 +463,24 @@ func (r *recordingPrior) BlockReader(relPath string, blockSize int) (PriorBlockR
 	return r.inner.BlockReader(relPath, blockSize)
 }
 
+//nolint:ireturn // mirrors the wrapped PriorImage signature
+func (r *recordingPrior) BlockReaderForObject(oid object.ID, blockSize int) (PriorBlockReader, error) {
+	r.blockReaderOIDs = append(r.blockReaderOIDs, oid)
+
+	return r.inner.BlockReaderForObject(oid, blockSize)
+}
+
 func (r *recordingPrior) Entry(relPath string) (*snapshot.DirEntry, error) {
 	return r.inner.Entry(relPath)
 }
 
 func (r *recordingPrior) Segments(relPath string) ([]object.ID, bool) {
 	return r.inner.Segments(relPath)
+}
+
+// priorReads is the number of prior-image readers opened, by either route.
+func (r *recordingPrior) priorReads() int {
+	return len(r.blockReaderPaths) + len(r.blockReaderOIDs)
 }
 
 // fileObjectID resolves the object ID of the file at relPath in a snapshot.
@@ -533,8 +548,9 @@ func TestIncrementalUnchangedFileReusesPriorObject(t *testing.T) {
 		})
 
 	// The metadata-only fast path must not read any prior blocks.
-	if len(rec.blockReaderPaths) != 0 {
-		t.Fatalf("expected no prior block reads for an unchanged file, got %v", rec.blockReaderPaths)
+	if rec.priorReads() != 0 {
+		t.Fatalf("expected no prior block reads for an unchanged file, got %d (paths %v, objects %v)",
+			rec.priorReads(), rec.blockReaderPaths, rec.blockReaderOIDs)
 	}
 
 	// Restore reproduces the original content.
@@ -942,7 +958,7 @@ func TestIncrementalShrunkFileFallsBackToReconstruct(t *testing.T) {
 			opts.Prior = rec
 		})
 
-	if len(rec.blockReaderPaths) == 0 {
+	if rec.priorReads() == 0 {
 		t.Fatal("shrunk file wrongly took the reuse fast path; expected block reads to reconstruct the prefix")
 	}
 

@@ -130,6 +130,28 @@ func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlock
 	}, nil
 }
 
+// BlockReaderForObject implements PriorImage: it opens a reader for a prior
+// object that the caller has already resolved, so the read can run off the
+// goroutine that walks the tar stream. Resolution stays on that goroutine
+// because it consults dirCache, which is deliberately unsynchronized.
+//
+// The object may be a whole prior file or a single prior segment of one; block
+// numbers are relative to whichever it is, which is what lets a rebuild read
+// just the 128 KB segment holding the blocks it needs.
+//
+//nolint:ireturn // returns the PriorBlockReader abstraction by design
+func (p *KopiaPriorImage) BlockReaderForObject(oid object.ID, blockSize int) (PriorBlockReader, error) {
+	reader, err := p.rep.OpenObject(p.ctx, oid)
+	if err != nil {
+		return nil, fmt.Errorf("while opening prior object %v: %w", oid, err)
+	}
+
+	return &objectBlockReader{
+		reader: reader, blockSize: blockSize, buf: make([]byte, blockSize),
+		bytesRead: &p.bytesRead, zeroFilled: &p.zeroFilledBlocks,
+	}, nil
+}
+
 // Entry implements PriorImage: it returns the prior snapshot's file entry for
 // relPath (its ObjectID and size), so an unchanged file can reference the prior
 // object directly without reading its blocks.
