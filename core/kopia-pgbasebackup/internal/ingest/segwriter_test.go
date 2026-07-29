@@ -162,8 +162,13 @@ func TestPipelinedFilesResolveIntoTheRightDirectories(t *testing.T) {
 		t.Fatalf("root object differs: sequential=%s pipelined=%s",
 			sequential.RootObjectID, pipelined.RootObjectID)
 	}
-	if !reflect.DeepEqual(sequential.Stats, pipelined.Stats) {
-		t.Fatalf("stats differ:\nsequential=%+v\npipelined=%+v", sequential.Stats, pipelined.Stats)
+	// Compare the counters but not Phases: those are timings, which differ
+	// between any two runs. Zeroing the field rather than listing the counters
+	// keeps a newly added counter covered by this check automatically.
+	seqCounters, pipeCounters := sequential.Stats, pipelined.Stats
+	seqCounters.Phases, pipeCounters.Phases = Phases{}, Phases{}
+	if !reflect.DeepEqual(seqCounters, pipeCounters) {
+		t.Fatalf("stats differ:\nsequential=%+v\npipelined=%+v", seqCounters, pipeCounters)
 	}
 	if !reflect.DeepEqual(sequential.SegmentMap, pipelined.SegmentMap) {
 		t.Fatal("segment maps differ")

@@ -104,6 +104,40 @@ type Stats struct {
 	// number it rewrote (readback confined to those segments' unchanged blocks).
 	ReferencedSegments int64
 	RebuiltSegments    int64
+
+	// Phases is where the ingest spent its time, by kind of work.
+	Phases Phases
+}
+
+// Phases accumulates where an ingest spent its wall time. The costs of this path
+// are dominated by round trips to the repository, and which round trips dominate
+// differs between a full backup (segment writes) and an incremental (prior-image
+// reads), so attributing them is the only way to know which one to attack. All
+// durations are in milliseconds; the concurrent ones sum across goroutines and so
+// can exceed the wall clock.
+type Phases struct {
+	// TarReadMS is time spent pulling bytes out of the tar stream, which is the
+	// floor set by PostgreSQL and the network.
+	TarReadMS int64
+
+	// PriorReadMS is time spent obtaining unchanged blocks from the prior backup
+	// to rebuild a dirty segment, and PriorBlockReads the number of blocks so
+	// obtained. Only a fraction of those reach the repository: Kopia's object
+	// reader holds the chunk it is positioned in, so the first block of a
+	// segment pays for fetching the whole segment and the rest are memory
+	// copies. PriorReadMS is therefore dominated by roughly one fetch per
+	// rebuilt segment, not by PriorBlockReads.
+	PriorReadMS     int64
+	PriorBlockReads int64
+
+	// SegmentWriteMS is time spent writing segment objects (hash plus the
+	// server's existence check plus the streamed write), summed across writers.
+	SegmentWriteMS int64
+
+	// IndexWriteMS is time spent writing the per-file seek tables, and
+	// FinalizeMS the directory manifests plus SaveSnapshot at end of stream.
+	IndexWriteMS int64
+	FinalizeMS   int64
 }
 
 // Result is the outcome of an ingest, serialized to stdout by the CLI.
@@ -195,6 +229,9 @@ type assembler struct {
 	compressor compression.Name
 	// segWriter writes segment objects concurrently.
 	segWriter *segmentWriter
+	// phases accumulates the per-kind timings reported in Stats. Segment writes
+	// are timed on the writer goroutines, so these are atomic.
+	phases phaseCounters
 	// pending holds the members already handed to the segment writers whose
 	// object is not resolved yet, in stream order. See resolveSettled.
 	pending []*pendingFile
@@ -281,6 +318,8 @@ func Run(ctx context.Context, rep repo.RepositoryWriter, tarStream io.Reader, op
 		return nil, err
 	}
 
+	finalizeStart := time.Now()
+
 	rootEntry, err := a.finalizeAll()
 	if err != nil {
 		return nil, err
@@ -304,6 +343,8 @@ func Run(ctx context.Context, rep repo.RepositoryWriter, tarStream io.Reader, op
 	if err != nil {
 		return nil, fmt.Errorf("while saving snapshot: %w", err)
 	}
+	a.phases.addFinalize(finalizeStart)
+	a.stats.Phases = a.phases.snapshot()
 
 	return &Result{
 		ManifestID:   string(manID),
@@ -582,7 +623,9 @@ func (a *assembler) writeSegmentedFile(
 	batch := newSegmentBatch()
 	for index := 0; !batch.failed(); index++ {
 		buf := a.segWriter.acquire()
+		readStart := time.Now()
 		n, err := io.ReadFull(content, buf[:a.segBytes])
+		a.phases.addTarRead(readStart)
 		if n > 0 {
 			a.segWriter.submit(batch, logical, index, buf, n)
 			written += int64(n)
@@ -705,6 +748,8 @@ func resolveCompressor(ctx context.Context, rep repo.Repository, source snapshot
 // ID. It is called from the segment-writer pool, so it must touch nothing on the
 // assembler beyond the repository writer and the resolved compressor.
 func (a *assembler) writeSegmentBytes(data []byte, logical string) (object.ID, error) {
+	defer a.phases.addSegmentWrite(time.Now())
+
 	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{Description: "SEG:" + logical, Compressor: a.compressor})
 	defer writer.Close() //nolint:errcheck
 
@@ -759,6 +804,8 @@ func (a *assembler) buildFileObject(logical string, segs []segRef) (object.ID, e
 		entries[i] = object.IndirectObjectEntry{Start: start, Length: s.length, Object: s.oid}
 		start += s.length
 	}
+
+	defer a.phases.addIndexWrite(time.Now())
 
 	writer := a.rep.NewObjectWriter(a.ctx, object.WriterOptions{
 		Description: "SEGIDX:" + logical,
@@ -994,7 +1041,10 @@ func (a *assembler) fillSegment(
 		block := dst[(i-start)*bs : (i-start+1)*bs]
 
 		if *cursor < len(h.BlockNumbers) && int(h.BlockNumbers[*cursor]) == i {
-			if _, err := io.ReadFull(blockData, block); err != nil {
+			readStart := time.Now()
+			_, err := io.ReadFull(blockData, block)
+			a.phases.addTarRead(readStart)
+			if err != nil {
 				return fmt.Errorf("while reading incremental block %d: %w", i, err)
 			}
 			*cursor++
@@ -1007,7 +1057,11 @@ func (a *assembler) fillSegment(
 			return err
 		}
 		blockNum := uint32(i) //nolint:gosec // block index fits uint32
-		if rerr := copyPriorOrZeroBlock(reader, blockNum, block); rerr != nil {
+		fetchStart := time.Now()
+		rerr := copyPriorOrZeroBlock(reader, blockNum, block)
+		a.phases.addPriorRead(fetchStart)
+		a.phases.addPriorBlockRead()
+		if rerr != nil {
 			return rerr
 		}
 	}

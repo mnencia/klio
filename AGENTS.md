@@ -139,6 +139,12 @@ Klio-only assertions) must live outside `machinery` — e.g. under
   - `operator/pkg/config/server.go` ↔ `core/pkg/config/server.go`
   - `operator/pkg/config/client.go` ↔ `core/pkg/config/client.go`
   - `operator/pkg/config/compression.go` ↔ `core/pkg/config/compression.go`
+  - `core/kopia-pgbasebackup/cmd/ingest.go` (`outputStats`) ↔
+    `core/internal/kopia/pgbasebackup.go` (`IngestStats`). The helper is a
+    separate module, so the JSON field names are the only thing connecting the
+    two: a statistic missing on the klio side is silently dropped rather than
+    failing to compile, which is how the segment-reference counters reached the
+    log only once someone went looking for them.
 
 - When you change a metric in `core/internal/opentelemetry/catalog.go`
   (rename, add, remove, or change a metric's unit, type, or attributes),

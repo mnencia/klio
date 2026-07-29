@@ -139,6 +139,23 @@ type IngestStats struct {
 	// blocks are read back.
 	ReferencedSegments int64 `json:"referencedSegments"`
 	RebuiltSegments    int64 `json:"rebuiltSegments"`
+
+	// Phases attributes the ingest's time to the kind of work that consumed it.
+	Phases IngestPhases `json:"phases"`
+}
+
+// IngestPhases is where an ingest spent its time. Which phase dominates says
+// what a slow backup was waiting for, and it differs by kind: a full backup is
+// mostly segment writes, an incremental mostly reads of the prior image. The
+// concurrent phases sum across the helper's writers, so they can exceed the
+// backup's wall time; that difference is the concurrency working.
+type IngestPhases struct {
+	TarReadMS       int64 `json:"tarReadMs"`
+	PriorReadMS     int64 `json:"priorReadMs"`
+	PriorBlockReads int64 `json:"priorBlockReads"`
+	SegmentWriteMS  int64 `json:"segmentWriteMs"`
+	IndexWriteMS    int64 `json:"indexWriteMs"`
+	FinalizeMS      int64 `json:"finalizeMs"`
 }
 
 // IngestResult is the single JSON object the helper prints on stdout when an
@@ -221,7 +238,13 @@ func (c *PgBaseBackupClient) Ingest(
 		"priorReadBytes", result.Stats.PriorReadBytes,
 		"zeroFilledBlocks", result.Stats.ZeroFilledBlocks,
 		"referencedSegments", result.Stats.ReferencedSegments,
-		"rebuiltSegments", result.Stats.RebuiltSegments)
+		"rebuiltSegments", result.Stats.RebuiltSegments,
+		"tarReadMs", result.Stats.Phases.TarReadMS,
+		"priorReadMs", result.Stats.Phases.PriorReadMS,
+		"priorBlockReads", result.Stats.Phases.PriorBlockReads,
+		"segmentWriteMs", result.Stats.Phases.SegmentWriteMS,
+		"indexWriteMs", result.Stats.Phases.IndexWriteMS,
+		"finalizeMs", result.Stats.Phases.FinalizeMS)
 
 	return result, nil
 }

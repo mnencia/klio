@@ -64,6 +64,26 @@ func TestParseIngestResult(t *testing.T) {
 		assert.Equal(t, int64(100), result.Stats.RebuiltSegments)
 	})
 
+	t.Run("phase timings are parsed", func(t *testing.T) {
+		// The helper reports these; without the field here they would be dropped
+		// while parsing and never reach the log, which is what makes a slow
+		// backup on a real cluster impossible to attribute.
+		input := []byte(`{
+			"manifestId": "m-1",
+			"stats": {"phases": {
+				"tarReadMs": 11, "priorReadMs": 22, "priorBlockReads": 33,
+				"segmentWriteMs": 44, "indexWriteMs": 55, "finalizeMs": 66
+			}}
+		}`)
+
+		result, err := parseIngestResult(input)
+		require.NoError(t, err)
+		assert.Equal(t, IngestPhases{
+			TarReadMS: 11, PriorReadMS: 22, PriorBlockReads: 33,
+			SegmentWriteMS: 44, IndexWriteMS: 55, FinalizeMS: 66,
+		}, result.Stats.Phases)
+	})
+
 	t.Run("surrounding whitespace is tolerated", func(t *testing.T) {
 		input := []byte("\n  {\"manifestId\": \"m-1\"}\n")
 

@@ -124,6 +124,21 @@ type outputStats struct {
 	// the prior backup (no readback), and RebuiltSegments the number rewritten.
 	ReferencedSegments int64 `json:"referencedSegments"`
 	RebuiltSegments    int64 `json:"rebuiltSegments"`
+
+	// Phases attributes the ingest's time to the kind of work that consumed it,
+	// which is what says whether a slow backup was waiting on PostgreSQL, on
+	// segment writes, or on reading the prior image back.
+	Phases phases `json:"phases"`
+}
+
+// phases mirrors ingest.Phases in the JSON contract.
+type phases struct {
+	TarReadMS       int64 `json:"tarReadMs"`
+	PriorReadMS     int64 `json:"priorReadMs"`
+	PriorBlockReads int64 `json:"priorBlockReads"`
+	SegmentWriteMS  int64 `json:"segmentWriteMs"`
+	IndexWriteMS    int64 `json:"indexWriteMs"`
+	FinalizeMS      int64 `json:"finalizeMs"`
 }
 
 func runIngest(cmd *cobra.Command, _ []string) error {
@@ -426,6 +441,14 @@ func emitResult(result *ingest.Result, uploaded, priorReadBytes, zeroFilledBlock
 			ZeroFilledBlocks:   zeroFilledBlocks,
 			ReferencedSegments: result.Stats.ReferencedSegments,
 			RebuiltSegments:    result.Stats.RebuiltSegments,
+			Phases: phases{
+				TarReadMS:       result.Stats.Phases.TarReadMS,
+				PriorReadMS:     result.Stats.Phases.PriorReadMS,
+				PriorBlockReads: result.Stats.Phases.PriorBlockReads,
+				SegmentWriteMS:  result.Stats.Phases.SegmentWriteMS,
+				IndexWriteMS:    result.Stats.Phases.IndexWriteMS,
+				FinalizeMS:      result.Stats.Phases.FinalizeMS,
+			},
 		},
 	}
 
