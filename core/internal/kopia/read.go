@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 
 	"github.com/cloudnative-pg/machinery/pkg/log"
 )
@@ -76,6 +77,27 @@ func (s *Client) ListSnapshots(
 
 	return entries, nil
 }
+
+// restoreParallelism is how many files Kopia restores at once.
+//
+// Kopia defaults to 8. A restore of a segment-ingested backup is bound by the
+// rate at which the repository server serves object fetches, not by the client:
+// each 128 KiB segment costs a round trip, and within one file the object reader
+// fetches one content at a time, so a stream tops out at roughly
+// segment_size / RTT regardless of available bandwidth or local CPU.
+//
+// Measured against a cross-zone server, reading distinct 1 GiB objects
+// concurrently: 8 streams sustained ~83 MB/s and 32 sustained ~124 MB/s, which
+// took a 566 GB restore from about two hours to eighty minutes. The gain is
+// sublinear because the ceiling is the server's fetch rate (~950 objects/s, near
+// its 2*NumCPU dispatch bound), so raising this much further buys little.
+//
+// Deliberately not scaled to the client's CPU count: the same 1.5x held at
+// GOMAXPROCS 1, 2, 4 and 8, because the client spends this time waiting on the
+// server rather than computing, and concurrency here buys overlapping waits. The
+// only client-side cost is memory for the in-flight files, which stayed under
+// 800 MB even when measured pessimistically as 32 separate processes.
+const restoreParallelism = 32
 
 // RestoreSingleFile restores a single file from a snapshot and returns its
 // contents. The logFn parameter controls how the operation is logged - callers
@@ -139,15 +161,7 @@ func (s *Client) RestoreSnapshot(
 ) error {
 	contextLogger := log.FromContext(ctx)
 
-	args := []string{
-		"restore",
-		"--config-file=" + s.ConfigFile,
-		"--disable-file-logging",
-		"--progress",
-		"--progress-update-interval=60s",
-		snapshotID,
-		destinationDirectory,
-	}
+	args := buildRestoreSnapshotArgs(s.ConfigFile, snapshotID, destinationDirectory)
 
 	contextLogger.Info("Restoring Kopia snapshot", "args", args)
 
@@ -159,4 +173,19 @@ func (s *Client) RestoreSnapshot(
 	}
 
 	return nil
+}
+
+// buildRestoreSnapshotArgs assembles the restore command line. The snapshot ID
+// and destination are positional, so they must stay last.
+func buildRestoreSnapshotArgs(configFile, snapshotID, destinationDirectory string) []string {
+	return []string{
+		"restore",
+		"--config-file=" + configFile,
+		"--disable-file-logging",
+		"--progress",
+		"--progress-update-interval=60s",
+		"--parallel=" + strconv.Itoa(restoreParallelism),
+		snapshotID,
+		destinationDirectory,
+	}
 }
