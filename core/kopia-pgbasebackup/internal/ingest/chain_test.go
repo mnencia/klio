@@ -317,8 +317,15 @@ func memberFor(t *testing.T, path string, prior, desired [][]byte, incremental b
 }
 
 // buildIncrementalMember builds an INCREMENTAL.* member with arbitrary present
-// block data (buildIncrementalFile only emits its fixed presentBlock pattern).
+// block data (buildIncrementalFile only emits its fixed presentBlock pattern),
+// at the default test block size.
 func buildIncrementalMember(truncation uint32, nums []uint32, data [][]byte) []byte {
+	return buildIncrementalMemberSized(truncation, nums, data, testBlockSize)
+}
+
+// buildIncrementalMemberSized is buildIncrementalMember for a caller using a
+// block size other than testBlockSize; the header padding depends on it.
+func buildIncrementalMemberSized(truncation uint32, nums []uint32, data [][]byte, blockSize int) []byte {
 	var buf bytes.Buffer
 	w32 := func(v uint32) {
 		var b [4]byte
@@ -332,7 +339,7 @@ func buildIncrementalMember(truncation uint32, nums []uint32, data [][]byte) []b
 		w32(n)
 	}
 	if len(nums) > 0 {
-		for buf.Len()%testBlockSize != 0 {
+		for buf.Len()%blockSize != 0 {
 			buf.WriteByte(0)
 		}
 		for _, d := range data {

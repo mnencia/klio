@@ -145,19 +145,39 @@ func TestParseIncrementalHeaderRejectsBlockBeyondTruncation(t *testing.T) {
 	}
 }
 
-func TestWritePriorOrZeroBlockZeroFillsBeyondPrior(t *testing.T) {
+func TestCopyPriorOrZeroBlockZeroFillsBeyondPrior(t *testing.T) {
 	// A block the prior image does not hold (io.EOF) is an uninitialized
-	// extension block below truncation: writePriorOrZeroBlock must zero-fill it,
+	// extension block below truncation: copyPriorOrZeroBlock must zero-fill it,
 	// matching pg_combinebackup, rather than failing. This is the shared helper
-	// the live rebuildSegment path uses; full-file reconstruction correctness is
+	// the live fillSegment path uses; full-file reconstruction correctness is
 	// covered by TestIncrementalSegmentReference and the chain test.
 	prior := mapPrior{blocks: map[uint32][]byte{1: priorBlock(1)}} // block 2 absent -> EOF
-	var out bytes.Buffer
-	if err := writePriorOrZeroBlock(prior, 2, make([]byte, testBlockSize), &out); err != nil {
-		t.Fatalf("writePriorOrZeroBlock: %v", err)
+	// Pre-dirtied, because the helper writes into a reused pool buffer and so
+	// must clear what was there rather than leave a stale block behind.
+	dst := bytes.Repeat([]byte{0xFF}, testBlockSize)
+	if err := copyPriorOrZeroBlock(prior, 2, dst); err != nil {
+		t.Fatalf("copyPriorOrZeroBlock: %v", err)
 	}
-	if !bytes.Equal(out.Bytes(), make([]byte, testBlockSize)) {
+	if !bytes.Equal(dst, make([]byte, testBlockSize)) {
 		t.Fatal("absent prior block should be zero-filled")
+	}
+}
+
+// shortPrior returns a block shorter than one block, modeling a broken
+// PriorBlockReader.
+type shortPrior struct{}
+
+func (shortPrior) ReadBlock(uint32) ([]byte, error) { return make([]byte, testBlockSize-1), nil }
+func (shortPrior) Close() error                     { return nil }
+
+func TestCopyPriorOrZeroBlockRejectsShortBlock(t *testing.T) {
+	// The destination is a window into a reused segment buffer, so accepting a
+	// short block would leave the previous segment's bytes in its tail. Fail
+	// instead of storing a segment that is part stale data.
+	dst := bytes.Repeat([]byte{0xFF}, testBlockSize)
+	err := copyPriorOrZeroBlock(shortPrior{}, 7, dst)
+	if !errors.Is(err, ErrBlockNotAvailable) {
+		t.Fatalf("expected ErrBlockNotAvailable, got %v", err)
 	}
 }
 
@@ -168,11 +188,11 @@ type errPrior struct{ err error }
 func (e errPrior) ReadBlock(uint32) ([]byte, error) { return nil, e.err }
 func (errPrior) Close() error                       { return nil }
 
-func TestWritePriorOrZeroBlockReadErrorFails(t *testing.T) {
+func TestCopyPriorOrZeroBlockReadErrorFails(t *testing.T) {
 	// A genuine (non-EOF) failure reading a needed prior block must fail loudly
 	// rather than silently zero-filling.
 	boom := errors.New("disk on fire")
-	err := writePriorOrZeroBlock(errPrior{err: boom}, 0, make([]byte, testBlockSize), &bytes.Buffer{})
+	err := copyPriorOrZeroBlock(errPrior{err: boom}, 0, make([]byte, testBlockSize))
 	if !errors.Is(err, ErrBlockNotAvailable) {
 		t.Fatalf("expected ErrBlockNotAvailable, got %v", err)
 	}

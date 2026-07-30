@@ -44,6 +44,46 @@ func TestParseIngestResult(t *testing.T) {
 		assert.Equal(t, int64(7), result.Stats.FileCount)
 	})
 
+	t.Run("incremental statistics are parsed", func(t *testing.T) {
+		// The segment counters were silently dropped before they were added to
+		// IngestStats, so the JSON names have to keep matching the helper's.
+		input := []byte(`{
+			"manifestId": "m-1",
+			"stats": {
+				"reusedFiles": 3, "priorReadBytes": 4096, "zeroFilledBlocks": 1,
+				"referencedSegments": 900, "rebuiltSegments": 100
+			}
+		}`)
+
+		result, err := parseIngestResult(input)
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), result.Stats.ReusedFiles)
+		assert.Equal(t, int64(4096), result.Stats.PriorReadBytes)
+		assert.Equal(t, int64(1), result.Stats.ZeroFilledBlocks)
+		assert.Equal(t, int64(900), result.Stats.ReferencedSegments)
+		assert.Equal(t, int64(100), result.Stats.RebuiltSegments)
+	})
+
+	t.Run("phase timings are parsed", func(t *testing.T) {
+		// The helper reports these; without the field here they would be dropped
+		// while parsing and never reach the log, which is what makes a slow
+		// backup on a real cluster impossible to attribute.
+		input := []byte(`{
+			"manifestId": "m-1",
+			"stats": {"phases": {
+				"tarReadMs": 11, "priorReadMs": 22, "priorBlockReads": 33,
+				"segmentWriteMs": 44, "indexWriteMs": 55, "finalizeMs": 66
+			}}
+		}`)
+
+		result, err := parseIngestResult(input)
+		require.NoError(t, err)
+		assert.Equal(t, IngestPhases{
+			TarReadMS: 11, PriorReadMS: 22, PriorBlockReads: 33,
+			SegmentWriteMS: 44, IndexWriteMS: 55, FinalizeMS: 66,
+		}, result.Stats.Phases)
+	})
+
 	t.Run("surrounding whitespace is tolerated", func(t *testing.T) {
 		input := []byte("\n  {\"manifestId\": \"m-1\"}\n")
 

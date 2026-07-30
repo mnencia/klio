@@ -224,10 +224,13 @@ snapshot from the Kopia library's lower-level building blocks instead of its
 high-level uploader. The uploader needs a filesystem it can read in parallel and
 seek within, so it cannot read from a one-way pipe.
 
-1. Each file member is streamed through a content-addressed object writer (which
-   deduplicates blocks on its own). This yields an object ID and a directory
-   entry that carries the metadata from the tar header (name, type, size, mode,
-   modification time, and ownership).
+1. Each file member is cut into fixed-size storage segments, each streamed
+   through its own content-addressed object writer (which deduplicates blocks on
+   its own), and the file's object is a seek table over those segments (see
+   [Combine-on-ingest](#combine-on-ingest), which is why files are stored this
+   way). This yields an object ID and a directory entry carrying the metadata
+   from the tar header (name, type, size, mode, modification time, and
+   ownership).
 1. Each entry is added to a per-directory builder, held in a map keyed by
    directory path. Parent directories are created on demand, so a member can
    arrive before its own directory member.
@@ -241,8 +244,68 @@ members in any order, including `pg_basebackup` sending `global/pg_control`
 last. An explicit directory member overrides the defaults of a directory that
 was created on demand.
 
-Files are ingested one at a time, but each large file is still uploaded in
-parallel chunks, so most of the work on big relation segments stays parallel.
+The tar stream is read by a single goroutine, in order, but the storage segments
+it cuts the stream into are written to the repository by a pool of writers (16
+by default). That is not a CPU optimization.
+Writing a segment through the Kopia repository server is latency-bound: the
+client hashes the segment locally, then blocks on a synchronous existence check
+(the server's deduplication pre-check, which the Kopia gRPC client performs for
+every write of 50 KB or more) before streaming the write itself asynchronously.
+At 128 KB segments that round trip dominates the per-segment cost, and on a full
+backup it seldom hits, since the data was just hashed for the first time. So a
+sequential writer spends most of a backup waiting, and overlapping the writes
+hides it: measured against a real Kopia server, a 2 GiB stream went from 14.3 s
+with one writer to 5.3 s with 16 (147 to 383 MiB/s), the latter being what that
+repository sustains with multi-megabyte objects. The useful concurrency is
+therefore set by the round-trip time rather than by the core count.
+
+A segment rebuilt from an `INCREMENTAL.*` member goes through the same pool, and
+for an incremental backup this is where nearly all of the time goes. Such a
+segment has two sources: the changed blocks, which arrive in the tar stream and
+so must be read in order, and its unchanged blocks, which come from the prior
+backup. Only the first is read on the goroutine walking the stream, which
+records the blocks it did not fill; a writer then obtains those from the prior
+image and writes the segment, so the reads overlap each other and the writes.
+
+Overlapping them matters more than it sounds. Obtaining one 128 KB segment from
+the repository costs about 8.4 ms against a cross-zone server, where moving the
+same bytes costs about 1 ms, and there is one such fetch per rebuilt segment: a
+566 GB incremental spent roughly 55 of its 59 minutes performing them one after
+another. Eight concurrent readers move 5.6x as much, and locally an incremental
+of 64 files with half their segments dirty went from 8.5 s to 2.7 s.
+
+A writer reads by object ID rather than by path, because resolving a path
+consults a cache that must not be touched concurrently; the reader resolves each
+member's prior file once and passes the ID down. That object is normally the
+prior backup's segment at the same index rather than the whole prior file, since
+it starts at the same block and, being a single content, costs one fetch and no
+seek table. It may be shorter than the segment it fills when the file has grown,
+which needs no special case: a block past its end reads as end-of-file, which
+the combine materializes as a zero-filled uninitialized extension block.
+
+The reader also does not stop at a file boundary. Waiting there would drain the
+pipeline once per file and cap the useful concurrency at the number of segments
+one file happens to have: a 256 KB relation is two segments, so waiting for it
+means two writes in flight instead of sixteen. Instead a file whose bytes have
+all been handed off is queued, and the reader resolves that queue between
+members, taking the ones whose segments have landed. Resolving a file is what
+writes its seek table, counts it, and files its directory entry.
+
+This is safe because a directory is only built at end of stream, and Kopia sorts
+a directory's entries when it builds the manifest, so a file resolved after the
+reader has moved past it lands in exactly the manifest it would have. Two rules
+keep the rest honest: a segment's buffer is owned by one party at a time (the
+reader while it fills it, then one writer until the segment is stored), and a
+file's segments are recorded by index, so neither a file's segment order nor the
+tree depends on the order the writers finish in. The queue is drained before
+the directories are finalized, and capped so that a single lagging file cannot
+let it grow without bound.
+
+Removing that per-file wait is worth about one round trip per file, which is the
+term that grows when the repository server is not next door: measured on that
+same server (round trip ~0.6 ms), 2000 files of 256 KB went from 2.9 s to 1.7 s
+once the wait was gone, a saving of 0.61 ms per file. A single large file sees
+no change, as it never waited for anything but its own tail.
 
 ### Byte-faithful reconstruction
 
@@ -375,11 +438,31 @@ instead of producing a corrupt object.
 
 An incremental needs the prior backup's per-file segment object IDs and the
 segment size they were written at. It resolves these from a **segment map**: a
-compressed directory-tree snapshot each backup writes, scoped and tagged like
-the source's data snapshot (`content=<source>-segmap`, plus the backup name), so
-it is resolved by tag and reaped with the backup like the `backup_manifest`. The
-root holds the segment size plus one subdirectory per file, whose entries are
-that file's storage segments in order.
+compressed directory-tree snapshot each backup writes, tagged like the source's
+data snapshot (`content=<source>-segmap`, plus the backup name) but on its **own
+Kopia source**, following the `pgdata_manifest` and `pgdata_meta` convention.
+The root holds the segment size plus one subdirectory per file, whose entries
+are that file's storage segments in order.
+
+The `_segmap` suffix attaches to the component that names the *kind* of source,
+never to the one that identifies it. For pgdata that is the whole path
+(`/pgdata` becomes `/pgdata_segmap`); for a tablespace, whose synthetic path is
+`/tablespace/<oid>`, it is the prefix, so `/tablespace/16385` becomes
+`/tablespace_segmap/16385` and the OID stays the leaf. Suffixing the OID instead
+would invent a tablespace named `16385_segmap` and leave the derived path still
+matching the `/tablespace/` prefix that identifies a tablespace source.
+
+The separate source is load-bearing, not cosmetic. Kopia enforces retention
+**per source**: `kopia snapshot expire` applies `keepLatest` and every bucket
+rule to each source independently. When the map shared the data snapshot's
+source, each backup consumed two of one budget, so `keepLatest: N` retained only
+about N/2 backups; and because the map is written *after* its data snapshot it
+always outranked it, so retention deleted data and kept maps. Reaping was not
+atomic, so the affected backup still reported itself complete and the loss
+surfaced only at recovery time. Reaping a map independently of its data snapshot
+is safe (see below: the data snapshot keeps segments reachable on its own), so
+the only cost of losing a map early is that the next incremental rebuilds
+instead of referencing.
 
 The map is stored as a tree, not a flat list of IDs, so it stays compact (the
 manifests compress well and each object ID appears once) and self-describing.
@@ -490,9 +573,11 @@ covering the backup is present.
   tagged with the backup name), next to the metadata snapshot and pinned with
   it. Retention treats it like the metadata.
 - Each source's segment map is stored as a compressed directory-tree snapshot
-  (`content=<source>-segmap`, tagged with the backup name) and reaped with the
-  backup like the manifest. It records that source's per-file storage-segment
-  object IDs and keeps them GC-reachable (see "The segment map").
+  (`content=<source>-segmap`, tagged with the backup name) on its own Kopia
+  source, the data source path with `_segmap` on its kind component, so that
+  Kopia's per-source retention gives it its own budget instead of spending the
+  data snapshot's (see "The segment map"). It records that source's per-file
+  storage-segment object IDs.
 - No per-source Kopia identifier is recorded in the backup metadata. The
   incremental combine base is identified by backup name only and resolved
   live by the helper at combine time (see "Selecting the prior backup").
@@ -528,6 +613,12 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
   block, so a change scattered uniformly across a relation grows the repository
   by roughly the touched segments rather than the logical change size; a
   localized change is far cheaper.
+- The read-back is overlapped, not removed. An incremental still transfers the
+  unchanged blocks of every segment holding a changed one, in both directions:
+  it reads them from the prior backup and writes them again. Concurrency hides
+  the latency of that, and compression shrinks what is stored, but the transfer
+  itself is inherent to rebuilding a segment (see the amplification limitation
+  above), and it is what a design that stored the delta instead would avoid.
 - Incremental reconstruction, like PostgreSQL's `pg_combinebackup`, cannot
   distinguish a genuinely uninitialized (all-zero) extension page from one whose
   modification the WAL summaries failed to record. A below-truncation block
@@ -546,7 +637,7 @@ linted on its own. See AGENTS.md for the commands and the dedicated CI tasks.
 - Helper invocation from `klio`: `core/internal/kopia/pgbasebackup.go` and
   `core/internal/client/klioclient/kopia/pgbasebackup.go`.
 - Ingestion helper (separate module): `core/kopia-pgbasebackup/` (`main.go`,
-  `internal/ingest/{ingest,incremental,prior,segmap}.go`).
+  `internal/ingest/{ingest,incremental,prior,segmap,segwriter,phases}.go`).
 - Restore (self-contained-tree handling):
   `core/internal/client/klioclient/restore.go`.
 - Operator configuration surface:

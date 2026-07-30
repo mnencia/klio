@@ -97,6 +97,11 @@ type IngestOptions struct {
 
 // IngestStats are the per-source ingestion statistics reported by the helper.
 // hashedBytes versus cachedBytes is the signal that deduplication is effective.
+//
+// The JSON names must match outputStats in
+// core/kopia-pgbasebackup/cmd/ingest.go. The helper is a separate Go module, so
+// nothing but that contract connects the two: a field missing here is silently
+// dropped rather than failing to compile.
 type IngestStats struct {
 	TotalSize   int64 `json:"totalSize"`
 	HashedBytes int64 `json:"hashedBytes"`
@@ -115,6 +120,38 @@ type IngestStats struct {
 	// uninitialized extension blocks (matching pg_combinebackup). Normally
 	// small; a spike may indicate a WAL-summary anomaly worth investigating.
 	ZeroFilledBlocks int64 `json:"zeroFilledBlocks"`
+
+	// ReferencedSegments is the number of storage segments an incremental took
+	// from the prior backup by object ID, and RebuiltSegments the number it
+	// wrote instead. A segment is rebuilt when it holds a changed block, but
+	// also when it cannot be referenced at all: the prior backup recorded no
+	// segment map, or recorded one at a different segment size, or the file grew
+	// past the prior image. So a high RebuiltSegments with little real churn
+	// means referencing was disabled, not that the database was busy.
+	//
+	// RebuiltSegments times the segment size bounds what the backup paid in
+	// stored bytes and in read-back; both come in lower, since stored segments
+	// are compressed and deduplicated, and only a rebuilt segment's unchanged
+	// blocks are read back.
+	ReferencedSegments int64 `json:"referencedSegments"`
+	RebuiltSegments    int64 `json:"rebuiltSegments"`
+
+	// Phases attributes the ingest's time to the kind of work that consumed it.
+	Phases IngestPhases `json:"phases"`
+}
+
+// IngestPhases is where an ingest spent its time. Which phase dominates says
+// what a slow backup was waiting for, and it differs by kind: a full backup is
+// mostly segment writes, an incremental mostly reads of the prior image. The
+// concurrent phases sum across the helper's writers, so they can exceed the
+// backup's wall time; that difference is the concurrency working.
+type IngestPhases struct {
+	TarReadMS       int64 `json:"tarReadMs"`
+	PriorReadMS     int64 `json:"priorReadMs"`
+	PriorBlockReads int64 `json:"priorBlockReads"`
+	SegmentWriteMS  int64 `json:"segmentWriteMs"`
+	IndexWriteMS    int64 `json:"indexWriteMs"`
+	FinalizeMS      int64 `json:"finalizeMs"`
 }
 
 // IngestResult is the single JSON object the helper prints on stdout when an
@@ -190,7 +227,15 @@ func (c *PgBaseBackupClient) Ingest(
 		"fileCount", result.Stats.FileCount,
 		"reusedFiles", result.Stats.ReusedFiles,
 		"priorReadBytes", result.Stats.PriorReadBytes,
-		"zeroFilledBlocks", result.Stats.ZeroFilledBlocks)
+		"zeroFilledBlocks", result.Stats.ZeroFilledBlocks,
+		"referencedSegments", result.Stats.ReferencedSegments,
+		"rebuiltSegments", result.Stats.RebuiltSegments,
+		"tarReadMs", result.Stats.Phases.TarReadMS,
+		"priorReadMs", result.Stats.Phases.PriorReadMS,
+		"priorBlockReads", result.Stats.Phases.PriorBlockReads,
+		"segmentWriteMs", result.Stats.Phases.SegmentWriteMS,
+		"indexWriteMs", result.Stats.Phases.IndexWriteMS,
+		"finalizeMs", result.Stats.Phases.FinalizeMS)
 
 	return result, nil
 }

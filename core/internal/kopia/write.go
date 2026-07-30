@@ -29,6 +29,33 @@ import (
 	"github.com/cloudnative-pg/machinery/pkg/log"
 )
 
+// verifyParallelism is how many verification requests Kopia is told to keep in
+// flight, for both the tree walk (--parallel) and the per-file checks
+// (--file-parallelism).
+//
+// Verifying a snapshot against a Kopia *server* is latency-bound, not
+// CPU-bound: with no --verify-files-percent no file data is read, and a remote
+// repository has no blob map, so the only work per object is one GetContentInfo
+// round trip to the server (see kopia's VerifyObject). A 566 GB backup at the
+// default 128 KB storage segments is ~4.6 M objects, so at Kopia's defaults
+// (--parallel 8, --file-parallelism runtime.NumCPU()) verification took ~22
+// minutes after the backup itself had finished.
+//
+// The useful value is therefore set by the round-trip time rather than by the
+// core count, which is why this is a constant and not derived from NumCPU: the
+// client may well be a CPU-limited sidecar facing an unchanged network.
+//
+// Measured on that same 4.6 M object backup: 21m54s at the defaults, 8m26s at
+// 32. The gain stops well short of the 4x the numbers suggest because the real
+// limit is on the other side — the server dispatches at most 2*NumCPU requests
+// at once (internal/server/grpc_session.go), which was 16 for that 8-CPU server
+// pod. Raising this further will not help; what removes the remaining cost is
+// verifying from inside the server, where the repository is direct and a content
+// lookup is local instead of a round trip. 32 keeps some headroom for larger
+// server pods while keeping the burst small enough not to starve another
+// cluster's backup sharing the same server.
+const verifyParallelism = 32
+
 // VerifyResult contains the parsed output from "kopia snapshot verify --json".
 type VerifyResult struct {
 	ErrorCount   int      `json:"errorCount"`
@@ -249,13 +276,15 @@ func (s *Client) VerifySnapshots(ctx context.Context, objectIDs ...string) (Veri
 
 // buildVerifyArgs builds the "kopia snapshot verify" arguments.
 func buildVerifyArgs(configFile string, objectIDs ...string) []string {
-	args := make([]string, 0, 5+len(objectIDs))
+	args := make([]string, 0, 7+len(objectIDs))
 	args = append(args,
 		"snapshot",
 		"verify",
 		"--json",
 		"--disable-file-logging",
 		"--config-file="+configFile,
+		fmt.Sprintf("--parallel=%d", verifyParallelism),
+		fmt.Sprintf("--file-parallelism=%d", verifyParallelism),
 	)
 
 	for _, id := range objectIDs {

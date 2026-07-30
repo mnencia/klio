@@ -79,7 +79,7 @@ type KopiaPriorImage struct {
 
 	// zeroFilledBlocks counts blocks requested past the end of a prior file
 	// object. Every such request is materialized by the combine as a zero-filled
-	// uninitialized extension block (see writePriorOrZeroBlock), so this is the
+	// uninitialized extension block (see copyPriorOrZeroBlock), so this is the
 	// number of blocks the backup manufactured rather than sourced - normally a
 	// small, steady number (e.g. pg_statistic churn); a spike is worth a look.
 	zeroFilledBlocks atomic.Int64
@@ -122,6 +122,28 @@ func (p *KopiaPriorImage) BlockReader(relPath string, blockSize int) (PriorBlock
 	reader, err := p.rep.OpenObject(p.ctx, entry.ObjectID)
 	if err != nil {
 		return nil, fmt.Errorf("while opening prior object for %q: %w", relPath, err)
+	}
+
+	return &objectBlockReader{
+		reader: reader, blockSize: blockSize, buf: make([]byte, blockSize),
+		bytesRead: &p.bytesRead, zeroFilled: &p.zeroFilledBlocks,
+	}, nil
+}
+
+// BlockReaderForObject implements PriorImage: it opens a reader for a prior
+// object that the caller has already resolved, so the read can run off the
+// goroutine that walks the tar stream. Resolution stays on that goroutine
+// because it consults dirCache, which is deliberately unsynchronized.
+//
+// The object may be a whole prior file or a single prior segment of one; block
+// numbers are relative to whichever it is, which is what lets a rebuild read
+// just the 128 KB segment holding the blocks it needs.
+//
+//nolint:ireturn // returns the PriorBlockReader abstraction by design
+func (p *KopiaPriorImage) BlockReaderForObject(oid object.ID, blockSize int) (PriorBlockReader, error) {
+	reader, err := p.rep.OpenObject(p.ctx, oid)
+	if err != nil {
+		return nil, fmt.Errorf("while opening prior object %v: %w", oid, err)
 	}
 
 	return &objectBlockReader{
@@ -242,9 +264,9 @@ type objectBlockReader struct {
 	blockSize int
 
 	// buf is reused across ReadBlock calls instead of allocating a fresh
-	// blockSize buffer each time. Safe: the caller (rebuildSegment) writes out
-	// each returned block immediately and never retains it, and one
-	// objectBlockReader is only ever driven synchronously from a single
+	// blockSize buffer each time. Safe: the caller (fillSegment) copies each
+	// returned block into the segment it is assembling and never retains it, and
+	// one objectBlockReader is only ever driven synchronously from a single
 	// combine for one file.
 	buf []byte
 
@@ -267,7 +289,7 @@ func (o *objectBlockReader) ReadBlock(n uint32) ([]byte, error) {
 
 	// A block that is not fully present in the prior object does not exist in
 	// the prior image. Report it as io.EOF so the combiner zero-fills it as an
-	// uninitialized extension block (see writePriorOrZeroBlock). This mirrors
+	// uninitialized extension block (see copyPriorOrZeroBlock). This mirrors
 	// pg_combinebackup, which sources only whole blocks below floor(len/BLCKSZ)
 	// and zero-fills the rest, so a non-block-aligned prior degrades gracefully
 	// instead of failing the backup.
