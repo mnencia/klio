@@ -25,11 +25,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/blob/filesystem"
 	"github.com/kopia/kopia/snapshot"
+	"github.com/kopia/kopia/snapshot/policy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -125,7 +127,7 @@ func ingestSourceSegmap(
 			}
 			segMap = res.SegmentMap
 
-			id, serr := ingest.SaveSegmentMap(ctx, w, source,
+			id, serr := ingest.SaveSegmentMap(ctx, w, segmapSource(source),
 				map[string]string{backupNameTag: tags[backupNameTag], contentTag: segmapContentValue(tags[contentTag])},
 				nil, "segment map", res.SegmentMap)
 			_ = id
@@ -374,4 +376,232 @@ func TestBuildPriorImageAmbiguousIsError(t *testing.T) {
 
 	_, err = buildPriorImage(ctx, rep, source, "backup-1", tags, 0)
 	require.ErrorIs(t, err, errAmbiguousPriorSnapshot)
+}
+
+// takeProtocolBackup performs one backup of source the way the protocol path
+// does: the data snapshot, then this backup's segment map in the same write
+// session through the production saveSegmentMap, so the test exercises the real
+// source derivation rather than a copy of it.
+func takeProtocolBackup(
+	ctx context.Context, t *testing.T, configFile string,
+	source snapshot.SourceInfo, backupName, content string, fileData []byte, segBytes int,
+) {
+	t.Helper()
+
+	rep, err := repo.Open(ctx, configFile, testPassword, &repo.Options{})
+	require.NoError(t, err)
+	defer rep.Close(ctx) //nolint:errcheck
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "base", Typeflag: tar.TypeDir, Mode: 0o700}))
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name: "base/1259", Typeflag: tar.TypeReg, Mode: 0o600, Size: int64(len(fileData)),
+	}))
+	_, err = tw.Write(fileData)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	opts := ingest.Options{
+		Source:       source,
+		Tags:         map[string]string{contentTag: content, backupNameTag: backupName},
+		BlockSize:    blockSize,
+		SegmentBytes: segBytes,
+	}
+
+	require.NoError(t, repo.WriteSession(ctx, rep, repo.WriteSessionOptions{Purpose: "test"},
+		func(ctx context.Context, w repo.RepositoryWriter) error {
+			res, runErr := ingest.Run(ctx, w, &buf, opts)
+			if runErr != nil {
+				return runErr
+			}
+
+			return saveSegmentMap(ctx, w, source, opts, res.SegmentMap)
+		}))
+}
+
+// setKeepLatestPolicy pins keepLatest on target and zeroes every other retention
+// rule. The zeroing matters: unset rules inherit kopia's global defaults
+// (keepHourly 48, keepDaily 7, ...), any of which would retain a snapshot that
+// keepLatest drops and make the assertions vacuous.
+func setKeepLatestPolicy(
+	ctx context.Context, t *testing.T, configFile string, target snapshot.SourceInfo, keepLatest int,
+) {
+	t.Helper()
+
+	rep, err := repo.Open(ctx, configFile, testPassword, &repo.Options{})
+	require.NoError(t, err)
+	defer rep.Close(ctx) //nolint:errcheck
+
+	zero := policy.OptionalInt(0)
+	keep := policy.OptionalInt(keepLatest)
+
+	require.NoError(t, repo.WriteSession(ctx, rep, repo.WriteSessionOptions{Purpose: "policy"},
+		func(ctx context.Context, w repo.RepositoryWriter) error {
+			return policy.SetPolicy(ctx, w, target, &policy.Policy{
+				RetentionPolicy: policy.RetentionPolicy{
+					KeepLatest:  &keep,
+					KeepHourly:  &zero,
+					KeepDaily:   &zero,
+					KeepWeekly:  &zero,
+					KeepMonthly: &zero,
+					KeepAnnual:  &zero,
+				},
+			})
+		}))
+}
+
+// expireAllSources applies retention to every source in the repository, which is
+// what klio's "kopia snapshot expire --delete klio@host" does: expiry is a
+// per-source operation, and that is the whole reason a shared source was unsafe.
+func expireAllSources(ctx context.Context, t *testing.T, configFile string) {
+	t.Helper()
+
+	rep, err := repo.Open(ctx, configFile, testPassword, &repo.Options{})
+	require.NoError(t, err)
+	defer rep.Close(ctx) //nolint:errcheck
+
+	require.NoError(t, repo.WriteSession(ctx, rep, repo.WriteSessionOptions{Purpose: "expire"},
+		func(ctx context.Context, w repo.RepositoryWriter) error {
+			sources, err := snapshot.ListSources(ctx, w)
+			if err != nil {
+				return err
+			}
+			for _, si := range sources {
+				if _, err := policy.ApplyRetentionPolicy(ctx, w, si, true); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		}))
+}
+
+// countSnapshotsByTag resolves snapshots the way a recovery does — by backup name
+// and content tag across the whole user@host, path-independent.
+func countSnapshotsByTag(
+	ctx context.Context, t *testing.T, configFile string, scope snapshot.SourceInfo, backupName, content string,
+) int {
+	t.Helper()
+
+	rep, err := repo.Open(ctx, configFile, testPassword, &repo.Options{})
+	require.NoError(t, err)
+	defer rep.Close(ctx) //nolint:errcheck
+
+	ids, err := snapshot.ListSnapshotManifests(ctx, rep, &scope, ingest.UserTagLabels(map[string]string{
+		backupNameTag: backupName,
+		contentTag:    content,
+	}))
+	require.NoError(t, err)
+
+	return len(ids)
+}
+
+// TestRetentionKeepsEveryRetainedBackupsData is the regression test for the
+// segment map sharing a Kopia source with the data snapshot.
+//
+// Kopia enforces retention per source, so a shared source spent two of every
+// keepLatest budget on a single backup, retaining only about N/2 backups. Worse,
+// the segment map is always written after its data snapshot, so under any count-
+// or time-bucket rule it outranked the data snapshot of the same backup:
+// retention deleted data and preserved segment maps. Reaping was not atomic, so
+// the backup kept advertising itself as complete and the loss surfaced only when
+// a recovery was attempted.
+//
+// With keepLatest=2 and three backups, both retained backups must still resolve
+// their own data snapshot. Before the fix the pgdata source held six snapshots
+// (three data, three maps) and only backup-3's data survived.
+func TestRetentionKeepsEveryRetainedBackupsData(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+	const segBytes = 2 * blockSize
+
+	source := snapshot.SourceInfo{Host: "c", UserName: "klio", Path: "/pgdata"}
+	scope := snapshot.SourceInfo{Host: source.Host, UserName: source.UserName}
+
+	setKeepLatestPolicy(ctx, t, configFile, scope, 2)
+
+	names := []string{"backup-1", "backup-2", "backup-3"}
+	for i, name := range names {
+		// Distinct data per backup, so the snapshots are not identical trees and
+		// cannot be collapsed by identical-snapshot handling.
+		takeProtocolBackup(ctx, t, configFile, source, name, "pgdata",
+			bytes.Repeat([]byte{byte(0x10 + i)}, blockSize), segBytes)
+	}
+
+	expireAllSources(ctx, t, configFile)
+
+	// The two newest backups keep their data: this is the property that broke.
+	for _, name := range []string{"backup-2", "backup-3"} {
+		assert.Equal(t, 1, countSnapshotsByTag(ctx, t, configFile, scope, name, "pgdata"),
+			"%s lost its data snapshot to retention while its metadata survived", name)
+	}
+
+	// And retention really ran, so the assertions above are not vacuous.
+	assert.Equal(t, 0, countSnapshotsByTag(ctx, t, configFile, scope, "backup-1", "pgdata"),
+		"retention did not expire the oldest backup, so this test proves nothing")
+
+	// Each source carries one snapshot per backup, so the segment maps are reaped
+	// on the same boundary as the data rather than outliving it.
+	assert.Equal(t, 0, countSnapshotsByTag(ctx, t, configFile, scope, "backup-1", "pgdata-segmap"))
+	for _, name := range []string{"backup-2", "backup-3"} {
+		assert.Equal(t, 1, countSnapshotsByTag(ctx, t, configFile, scope, name, "pgdata-segmap"))
+	}
+}
+
+// TestSegmentMapUsesItsOwnSource states the structural invariant behind the
+// retention fix directly, independent of any policy: the segment map must not
+// land on the data snapshot's source.
+func TestSegmentMapUsesItsOwnSource(t *testing.T) {
+	ctx := context.Background()
+	configFile := newRepo(ctx, t)
+
+	source := snapshot.SourceInfo{Host: "c", UserName: "klio", Path: "/pgdata"}
+	takeProtocolBackup(ctx, t, configFile, source, "backup-1", "pgdata",
+		bytes.Repeat([]byte{0x11}, blockSize), 2*blockSize)
+
+	rep, err := repo.Open(ctx, configFile, testPassword, &repo.Options{})
+	require.NoError(t, err)
+	defer rep.Close(ctx) //nolint:errcheck
+
+	sources, err := snapshot.ListSources(ctx, rep)
+	require.NoError(t, err)
+
+	paths := make([]string, 0, len(sources))
+	for _, si := range sources {
+		paths = append(paths, si.Path)
+	}
+	assert.ElementsMatch(t, []string{"/pgdata", "/pgdata_segmap"}, paths,
+		"the segment map must occupy its own source, since kopia expires per source")
+}
+
+// TestSegmapSourceDerivation pins where the _segmap suffix lands. It must attach
+// to the component naming the kind of source, never to the one identifying it, so
+// that a tablespace keeps its OID as the leaf and no derived path answers "yes" to
+// tablespacePathPrefix — the prefix buildPriorImage uses to decide whether a
+// source is a tablespace at all.
+func TestSegmapSourceDerivation(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "pgdata", path: "/var/lib/postgresql/data/pgdata", want: "/var/lib/postgresql/data/pgdata_segmap"},
+		{name: "pgdata with trailing slash", path: "/pgdata/", want: "/pgdata_segmap"},
+		{name: "tablespace keeps its oid as the leaf", path: "/tablespace/16385", want: "/tablespace_segmap/16385"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := segmapSource(snapshot.SourceInfo{Host: "c", UserName: "klio", Path: tc.path})
+
+			assert.Equal(t, tc.want, got.Path)
+			// Host and user name identify the cluster and must be carried over
+			// unchanged, or the map lands under a different identity than its data.
+			assert.Equal(t, "c", got.Host)
+			assert.Equal(t, "klio", got.UserName)
+			assert.False(t, strings.HasPrefix(got.Path, tablespacePathPrefix),
+				"a segmap source must not look like a tablespace source")
+		})
+	}
 }

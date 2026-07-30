@@ -52,6 +52,22 @@ const (
 // from making the data snapshot's resolution ambiguous.
 const segmentMapContentSuffix = "-segmap"
 
+// segmentMapPathSuffix forms the segment map's own Kopia source from the data
+// source's path (e.g. "/pgdata" -> "/pgdata_segmap"), mirroring the
+// pgdata_manifest and pgdata_meta convention in the core module. See segmapSource
+// for where the suffix lands on a tablespace.
+//
+// The segment map MUST live on its own source, because Kopia's retention is
+// enforced per source: `kopia snapshot expire` applies keepLatest (and every
+// other rule) to each source's snapshots independently. Sharing a source with
+// the data snapshot put two snapshots per backup into one budget, so keepLatest
+// N retained only about N/2 backups. Worse, the segment map is written after its
+// data snapshot, so under any count- or time-bucket rule it outranked the data
+// snapshot of the same backup and retention deleted data while keeping segment
+// maps — and because reaping was not atomic, the backup still advertised itself
+// as complete until a recovery failed.
+const segmentMapPathSuffix = "_segmap"
+
 // tablespacePathPrefix is the synthetic SourceInfo.Path prefix core's
 // executor.go gives every tablespace source ("/tablespace/<oid>"), used
 // here to recognize a tablespace source without needing its own tag.
@@ -257,12 +273,19 @@ func ingestIntoRepo(
 }
 
 // saveSegmentMap persists this backup's segment map as its own compressed,
-// tagged directory-tree snapshot, in the same write session as the data snapshot.
-// It is scoped to the same source and tagged with the backup name plus a segmap
-// content type, so it is resolved by tags and reaped with the backup like the
-// manifest. Every backup that stores segments (full, referencing incremental,
-// and rebuild-all incremental alike) writes one; a source with no files writes
+// tagged directory-tree snapshot, in the same write session as the data snapshot
+// so the two commit together. It is written to the source's derived segmap source
+// (see segmentMapPathSuffix) and tagged with the backup name plus a segmap
+// content type, so it is resolved by tags and keeps its own retention budget.
+// Every backup that stores segments (full, referencing incremental, and
+// rebuild-all incremental alike) writes one; a source with no files writes
 // nothing.
+//
+// Reaping a segment map independently of its data snapshot is safe: the data
+// snapshot references every segment object directly, so segments stay
+// GC-reachable without the map (see ingest.SaveSegmentMap). A map that outlives
+// its data snapshot only wastes space, and one that is reaped early costs the
+// next incremental its referencing, never correctness.
 func saveSegmentMap(
 	ctx context.Context, w repo.RepositoryWriter, source snapshot.SourceInfo,
 	opts ingest.Options, segMap ingest.SegmentMap,
@@ -276,7 +299,7 @@ func saveSegmentMap(
 	tags[contentTag] = segmapContentValue(opts.Tags[contentTag])
 
 	if _, err := ingest.SaveSegmentMap(
-		ctx, w, source, tags, opts.Pins, "segment map for "+source.Path, segMap,
+		ctx, w, segmapSource(source), tags, opts.Pins, "segment map for "+source.Path, segMap,
 	); err != nil {
 		return fmt.Errorf("while saving segment map: %w", err)
 	}
@@ -289,6 +312,31 @@ func saveSegmentMap(
 // segmentMapContentSuffix for why the value is distinct.
 func segmapContentValue(dataContent string) string {
 	return dataContent + segmentMapContentSuffix
+}
+
+// segmapSource derives the segment map's own Kopia source from the data source.
+// See segmentMapPathSuffix for why the segment map must not share a source.
+//
+// The suffix always lands on the component that names the *kind* of source, never
+// on the one that identifies it. For pgdata that is the whole path
+// ("/pgdata" -> "/pgdata_segmap"). For a tablespace, whose synthetic path is
+// "/tablespace/<oid>", it is the prefix ("/tablespace/16385" ->
+// "/tablespace_segmap/16385"), so the OID stays the leaf. Suffixing the OID
+// instead would both invent a tablespace named "16385_segmap" and leave the
+// derived path matching tablespacePathPrefix, i.e. still answering "yes" to "is
+// this a tablespace source?".
+func segmapSource(source snapshot.SourceInfo) snapshot.SourceInfo {
+	segmap := source
+
+	if oid, isTablespace := strings.CutPrefix(source.Path, tablespacePathPrefix); isTablespace {
+		segmap.Path = strings.TrimSuffix(tablespacePathPrefix, "/") + segmentMapPathSuffix + "/" + oid
+
+		return segmap
+	}
+
+	segmap.Path = strings.TrimSuffix(source.Path, "/") + segmentMapPathSuffix
+
+	return segmap
 }
 
 // buildPriorImage resolves the prior backup's snapshot for this same source
@@ -305,9 +353,14 @@ func buildPriorImage(
 		return nil, errIncrementalRequiresPrevious
 	}
 
+	// A tablespace is pinned to its path, so its segment map must be looked up on
+	// the derived segmap path rather than the data path; pgdata resolves purely by
+	// tag and needs no path at all.
 	scope := snapshot.SourceInfo{Host: source.Host, UserName: source.UserName}
+	segmapScope := scope
 	if strings.HasPrefix(source.Path, tablespacePathPrefix) {
 		scope.Path = source.Path
+		segmapScope.Path = segmapSource(source).Path
 	}
 
 	man, err := resolvePriorSnapshot(ctx, rep, scope, previousBackupName, tagMap[contentTag])
@@ -321,7 +374,7 @@ func buildPriorImage(
 	prior := ingest.NewKopiaPriorImage(ctx, rep, man.RootEntry.ObjectID)
 
 	if err := installPriorSegments(
-		ctx, rep, prior, scope, previousBackupName, tagMap[contentTag], segmentBlocks,
+		ctx, rep, prior, segmapScope, previousBackupName, tagMap[contentTag], segmentBlocks,
 	); err != nil {
 		return nil, err
 	}
@@ -374,10 +427,11 @@ func resolvePriorSnapshot(
 
 // installPriorSegments resolves the prior backup's segment-map snapshot for this
 // source and installs its per-file segment IDs on prior, enabling segment
-// referencing. It is a no-op — leaving the incremental to rebuild every segment
-// — when the prior recorded no segment map (a backup taken before this feature)
-// or when the prior's segment size differs from the configured one, since
-// referencing a differently-sized segment would corrupt the file.
+// referencing. scope must be the segmap scope, not the data scope. It is a no-op
+// — leaving the incremental to rebuild every segment — when the prior recorded no
+// segment map (a backup taken before this feature, or one whose map has since
+// been reaped) or when the prior's segment size differs from the configured one,
+// since referencing a differently-sized segment would corrupt the file.
 func installPriorSegments(
 	ctx context.Context, rep repo.Repository, prior *ingest.KopiaPriorImage,
 	scope snapshot.SourceInfo, previousBackupName, content string, segmentBlocks int,

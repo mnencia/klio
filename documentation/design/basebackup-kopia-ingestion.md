@@ -438,11 +438,31 @@ instead of producing a corrupt object.
 
 An incremental needs the prior backup's per-file segment object IDs and the
 segment size they were written at. It resolves these from a **segment map**: a
-compressed directory-tree snapshot each backup writes, scoped and tagged like
-the source's data snapshot (`content=<source>-segmap`, plus the backup name), so
-it is resolved by tag and reaped with the backup like the `backup_manifest`. The
-root holds the segment size plus one subdirectory per file, whose entries are
-that file's storage segments in order.
+compressed directory-tree snapshot each backup writes, tagged like the source's
+data snapshot (`content=<source>-segmap`, plus the backup name) but on its **own
+Kopia source**, following the `pgdata_manifest` and `pgdata_meta` convention.
+The root holds the segment size plus one subdirectory per file, whose entries
+are that file's storage segments in order.
+
+The `_segmap` suffix attaches to the component that names the *kind* of source,
+never to the one that identifies it. For pgdata that is the whole path
+(`/pgdata` becomes `/pgdata_segmap`); for a tablespace, whose synthetic path is
+`/tablespace/<oid>`, it is the prefix, so `/tablespace/16385` becomes
+`/tablespace_segmap/16385` and the OID stays the leaf. Suffixing the OID instead
+would invent a tablespace named `16385_segmap` and leave the derived path still
+matching the `/tablespace/` prefix that identifies a tablespace source.
+
+The separate source is load-bearing, not cosmetic. Kopia enforces retention
+**per source**: `kopia snapshot expire` applies `keepLatest` and every bucket
+rule to each source independently. When the map shared the data snapshot's
+source, each backup consumed two of one budget, so `keepLatest: N` retained only
+about N/2 backups; and because the map is written *after* its data snapshot it
+always outranked it, so retention deleted data and kept maps. Reaping was not
+atomic, so the affected backup still reported itself complete and the loss
+surfaced only at recovery time. Reaping a map independently of its data snapshot
+is safe (see below: the data snapshot keeps segments reachable on its own), so
+the only cost of losing a map early is that the next incremental rebuilds
+instead of referencing.
 
 The map is stored as a tree, not a flat list of IDs, so it stays compact (the
 manifests compress well and each object ID appears once) and self-describing.
@@ -553,9 +573,11 @@ covering the backup is present.
   tagged with the backup name), next to the metadata snapshot and pinned with
   it. Retention treats it like the metadata.
 - Each source's segment map is stored as a compressed directory-tree snapshot
-  (`content=<source>-segmap`, tagged with the backup name) and reaped with the
-  backup like the manifest. It records that source's per-file storage-segment
-  object IDs and keeps them GC-reachable (see "The segment map").
+  (`content=<source>-segmap`, tagged with the backup name) on its own Kopia
+  source, the data source path with `_segmap` on its kind component, so that
+  Kopia's per-source retention gives it its own budget instead of spending the
+  data snapshot's (see "The segment map"). It records that source's per-file
+  storage-segment object IDs.
 - No per-source Kopia identifier is recorded in the backup metadata. The
   incremental combine base is identified by backup name only and resolved
   live by the helper at combine time (see "Selecting the prior backup").
